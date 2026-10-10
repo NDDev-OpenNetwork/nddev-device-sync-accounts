@@ -1,5 +1,8 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
 pub mod device_wire;
+mod sync;
+pub mod sync_wire;
+pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
 mod store;
@@ -28,6 +31,15 @@ const MAX_BODY: usize = 65_536;
 
 pub mod view;
 pub use view::{ClientError, View};
+
+struct WireRequest<'a> {
+    method: Method,
+    path: &'a str,
+    body: Option<Vec<u8>>,
+    token: Option<&'a str>,
+    locale: &'a str,
+    signature: Option<nddev_device_sync_http_signatures::Headers>,
+}
 
 enum Flow {
     Email {
@@ -594,6 +606,41 @@ impl IdentityClient {
         locale: &str,
         cancel: &CancellationToken,
     ) -> Result<(StatusCode, Vec<u8>), ClientError> {
+        let body = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| ClientError::InvalidInput)?;
+        self.request_bytes(
+            WireRequest {
+                method,
+                path,
+                body,
+                token,
+                locale,
+                signature: None,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    async fn request_bytes(
+        &self,
+        options: WireRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<(StatusCode, Vec<u8>), ClientError> {
+        let WireRequest {
+            method,
+            path,
+            body,
+            token,
+            locale,
+            signature,
+        } = options;
+        if body.as_ref().is_some_and(|body| body.len() > MAX_BODY) {
+            return Err(ClientError::InvalidInput);
+        }
+        let signed = signature.is_some();
         let span = nddev_device_sync_telemetry::operation_span("accounts", "http")
             .map_err(|_| ClientError::TelemetryUnavailable)?;
         let context = nddev_device_sync_telemetry::trace_context(&span);
@@ -627,7 +674,10 @@ impl IdentityClient {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
-            request = request.json(body);
+            request = request.header("content-type","application/json").body(body);
+        }
+        if let Some(signature) = signature {
+            request = request.header("signature",signature.signature).header("signature-input",signature.signature_input).header("content-digest",signature.content_digest);
         }
         let operation = async {
             let mut response = request.send().await.map_err(|e| {
@@ -652,6 +702,11 @@ impl IdentityClient {
                 bytes.extend_from_slice(&chunk);
             }
             if !status.is_success() {
+                // A retained revision conflict is a sync result, not a generic
+                // error. Preserve its exact bytes for the durable client inbox.
+                if signed && status==StatusCode::CONFLICT && matches!(serde_json::from_slice::<sync_wire::Sync>(&bytes), Ok(sync_wire::Sync::Conflict(_))) {
+                    return Ok((status,bytes));
+                }
                 let response: wire::Error = decode(&bytes)?;
                 let code = serde_json::to_value(response.error)
                     .map_err(|_| ClientError::InvalidResponse)?;

@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.11"
+version = "0.0.1-alpha.12"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -11,11 +11,12 @@ default = []
 development-http = []
 
 [dependencies]
+nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "28c3182a40750ca6cc6ec3f96658346cfde8ec16" }
 base64 = "0.22"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
 keyring-core = "1.0.0"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "c20834d557fdc875b47bf8c97e221f6a119b62bd" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "3400a9d766fa2838973fab96981806c9c25eef5d" }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
