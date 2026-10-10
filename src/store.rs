@@ -91,6 +91,9 @@ impl NativeSessionStore {
             let _permit = permit;
             let _owner = owner;
             let started = Instant::now();
+                    tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
+                        event.name=event, outcome="started"
+                    });
             let result = (|| {
             let store = native_store().map_err(|_| ClientError::CredentialStore)?;
             #[cfg(target_os = "ios")]
