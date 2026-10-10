@@ -1,4 +1,6 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
+pub mod device_wire;
+mod devices;
 pub mod health_wire;
 mod store;
 pub mod wire;
@@ -522,6 +524,9 @@ impl IdentityClient {
         s.view.tenant_id.clear();
         s.view.expires_at.clear();
         s.view.auth_method.clear();
+        s.view.devices.clear();
+        s.view.current_device_id.clear();
+        s.view.devices_checked_at = 0;
     }
 
     fn require_revalidation(&self) {
@@ -550,7 +555,7 @@ impl IdentityClient {
 
     async fn get<T: DeserializeOwned>(
         &self,
-        path: &'static str,
+        path: &str,
         token: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<T, ClientError> {
@@ -565,7 +570,7 @@ impl IdentityClient {
 
     async fn post<T: Serialize, R: DeserializeOwned>(
         &self,
-        path: &'static str,
+        path: &str,
         body: &T,
         expected_status: StatusCode,
         locale: &str,
@@ -583,7 +588,7 @@ impl IdentityClient {
     async fn request<T: Serialize>(
         &self,
         method: Method,
-        path: &'static str,
+        path: &str,
         body: Option<&T>,
         token: Option<&str>,
         locale: &str,
@@ -592,10 +597,18 @@ impl IdentityClient {
         let span = nddev_device_sync_telemetry::operation_span("accounts", "http")
             .map_err(|_| ClientError::TelemetryUnavailable)?;
         let context = nddev_device_sync_telemetry::trace_context(&span);
+        // Normalize device paths before recording them; queries and IDs stay out.
+        let route = if path.starts_with("/v2/devices/")
+            && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
+        {
+            "/v2/devices/{device_id}"
+        } else {
+            path.split('?').next().unwrap_or("unknown")
+        };
         async {
         let started = Instant::now();
         tracing::event!(target: "nds_accounts", tracing::Level::DEBUG,
-            { event.name = "identity.request_started", route = path });
+            { event.name = "identity.request_started", route });
         let mut propagation = std::collections::HashMap::new();
         TraceContextPropagator::new().inject_context(&context, &mut propagation);
         let mut request = self
@@ -642,6 +655,9 @@ impl IdentityClient {
                 let response: wire::Error = decode(&bytes)?;
                 let code = serde_json::to_value(response.error)
                     .map_err(|_| ClientError::InvalidResponse)?;
+                if token.is_some() && code.as_str() == Some("authentication_failed") {
+                    self.require_revalidation();
+                }
                 return Err(ClientError::Server(
                     code.as_str()
                         .ok_or(ClientError::InvalidResponse)?
@@ -657,10 +673,10 @@ impl IdentityClient {
         };
         match &result {
             Ok((status, _)) => tracing::event!(target: "nds_accounts", tracing::Level::INFO,
-                { event.name = "identity.request_completed", route = path, status = status.as_u16(),
+                { event.name = "identity.request_completed", route, status = status.as_u16(),
                   duration_ms = started.elapsed().as_millis() as u64, outcome = "ok" }),
             Err(error) => tracing::event!(target: "nds_accounts", tracing::Level::WARN,
-                { event.name = "identity.request_completed", route = path, error.type = error.code(),
+                { event.name = "identity.request_completed", route, error.type = error.code(),
                   duration_ms = started.elapsed().as_millis() as u64, outcome = "error" }),
         }
         result
