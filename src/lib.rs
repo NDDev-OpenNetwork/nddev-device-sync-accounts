@@ -72,6 +72,9 @@ pub struct IdentityClient {
 }
 
 impl IdentityClient {
+    pub fn origin(&self) -> String {
+        self.endpoint.as_str().into()
+    }
     pub fn new(endpoint: &str) -> Result<Self, ClientError> {
         let endpoint = validate_endpoint(endpoint)?;
         let _ = rustls::crypto::ring::default_provider().install_default();
