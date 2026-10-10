@@ -137,6 +137,15 @@ async fn actual_socket_propagates_the_same_trace_as_bounded_client_events() {
         );
         assert!(event.get("operation").is_none());
     }
+    let flow = events
+        .iter()
+        .find(|event| event["event.name"] == "identity.refresh")
+        .unwrap();
+    let parts: Vec<_> = context.split('-').collect();
+    assert_eq!(flow["trace_id"], parts[1]);
+    assert_ne!(flow["span_id"], parts[2]);
+    assert_eq!(flow["error.type"], "cancelled");
+    assert_eq!(flow["scope"], "process");
     assert_eq!(control.rejected_fields_or_events(), 0);
     assert_eq!(control.write_failures(), 0);
     assert!(!control.debug_active());

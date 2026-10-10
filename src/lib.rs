@@ -118,7 +118,34 @@ impl IdentityClient {
         Ok((permit, token))
     }
 
+    async fn observe(
+        &self,
+        event: &'static str,
+        operation: impl std::future::Future<Output = Result<View, ClientError>>,
+    ) -> Result<View, ClientError> {
+        let span = nddev_device_sync_telemetry::operation_span("accounts", "process")
+            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        async {
+            let started = Instant::now();
+            let result = operation.await;
+            match &result {
+                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
+                    event.name=event,duration_ms=started.elapsed().as_millis() as u64,outcome="ok"
+                }),
+                Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                    event.name=event,duration_ms=started.elapsed().as_millis() as u64,error.type=error.code(),outcome="error"
+                }),
+            }
+            result
+        }.instrument(span).await
+    }
+
     pub async fn refresh(&self) -> Result<View, ClientError> {
+        self.observe("identity.refresh", self.refresh_operation())
+            .await
+    }
+
+    async fn refresh_operation(&self) -> Result<View, ClientError> {
         let (_permit, cancel) = self.operation()?;
         self.state
             .lock()
@@ -168,6 +195,18 @@ impl IdentityClient {
     }
 
     pub async fn request_email(&self, email: String, locale: &str) -> Result<View, ClientError> {
+        self.observe(
+            "identity.email.request",
+            self.request_email_operation(email, locale),
+        )
+        .await
+    }
+
+    async fn request_email_operation(
+        &self,
+        email: String,
+        locale: &str,
+    ) -> Result<View, ClientError> {
         if !(3..=254).contains(&email.len()) {
             return Err(ClientError::InvalidInput);
         }
@@ -207,6 +246,11 @@ impl IdentityClient {
     }
 
     pub async fn verify_email(&self, code: String) -> Result<View, ClientError> {
+        self.observe("identity.email.verify", self.verify_email_operation(code))
+            .await
+    }
+
+    async fn verify_email_operation(&self, code: String) -> Result<View, ClientError> {
         if code.len() != 8 || !code.bytes().all(|c| c.is_ascii_digit()) {
             return Err(ClientError::InvalidInput);
         }
@@ -235,6 +279,11 @@ impl IdentityClient {
     }
 
     pub async fn start_github(&self, locale: &str) -> Result<View, ClientError> {
+        self.observe("identity.github.start", self.start_github_operation(locale))
+            .await
+    }
+
+    async fn start_github_operation(&self, locale: &str) -> Result<View, ClientError> {
         self.require_store_ready()?;
         let (_permit, cancel) = self.operation()?;
         let response: wire::GithubStart = self
@@ -274,6 +323,11 @@ impl IdentityClient {
     }
 
     pub async fn poll_github(&self) -> Result<View, ClientError> {
+        self.observe("identity.github.poll", self.poll_github_operation())
+            .await
+    }
+
+    async fn poll_github_operation(&self) -> Result<View, ClientError> {
         let (_permit, cancel) = self.operation()?;
         let request = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -360,6 +414,11 @@ impl IdentityClient {
     }
 
     pub async fn logout(&self) -> Result<View, ClientError> {
+        self.observe("identity.logout", self.logout_operation())
+            .await
+    }
+
+    async fn logout_operation(&self) -> Result<View, ClientError> {
         let (_permit, cancel) = self.operation()?;
         let secret = self.store.read().await?;
         if let Some(secret) = secret {
