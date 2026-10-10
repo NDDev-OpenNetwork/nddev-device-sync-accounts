@@ -17,6 +17,9 @@ HTTP redirects are rejected. Requests and native operations have 15-second
 deadlines; overlapping calls return `busy` instead of entering an unbounded queue.
 Native OS calls cannot be preempted, so their single admission permit remains
 held until the OS call actually returns, including after a caller timeout.
+Native read/write/delete outcomes use the same SDK and retain trace context across
+the blocking OS worker. A caller wait failure and a later OS completion are distinct;
+keys, endpoints, secret values and raw provider errors never enter those events.
 
 Linux uses Secret Service, Android uses Android Keystore-encrypted preferences
 with an application-context JNI initializer, Apple uses Keychain and Windows
