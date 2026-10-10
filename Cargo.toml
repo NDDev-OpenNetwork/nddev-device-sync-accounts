@@ -12,7 +12,7 @@ development-http = []
 
 [dependencies]
 keyring-core = "1.0.0"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "9bc379e0a0d921b8478fb2e736d97280ce3dc0aa" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "c20834d557fdc875b47bf8c97e221f6a119b62bd" }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
