@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 const SERVICE: &str = "ai.nddev.nds.session.v2";
 
 /// Explicit native backends. No global default store, mock or file fallback.
+#[derive(Clone)]
 pub struct NativeSessionStore {
     service: &'static str,
     key: String,
@@ -66,6 +67,12 @@ impl NativeSessionStore {
             key: format!("{:x}", digest.finalize()),
             owner: self.owner.clone(),
         }
+    }
+
+    pub(crate) fn vault_store(&self, tenant: &str, user: &str) -> Self {
+        let mut store = self.device_store(tenant, user);
+        store.service = "ai.nddev.nds.vault.v1";
+        store
     }
 
     pub(crate) fn operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 impl IdentityClient {
-    fn device_store(&self) -> Result<crate::NativeSessionStore, ClientError> {
+    pub(crate) fn device_store(&self) -> Result<crate::NativeSessionStore, ClientError> {
         let view = self.view();
         if !view.authenticated || !view.session_verified || view.credential_revalidation_required {
             return Err(ClientError::RevalidationRequired);
@@ -20,7 +20,7 @@ impl IdentityClient {
         Ok(self.store.device_store(&view.tenant_id, &view.user_id))
     }
 
-    async fn session_token(&self) -> Result<Zeroizing<String>, ClientError> {
+    pub(crate) async fn session_token(&self) -> Result<Zeroizing<String>, ClientError> {
         let secret = self
             .store
             .read()
@@ -275,7 +275,9 @@ impl IdentityClient {
     }
 }
 
-async fn read_key(store: &crate::NativeSessionStore) -> Result<Option<SigningKey>, ClientError> {
+pub(crate) async fn read_key(
+    store: &crate::NativeSessionStore,
+) -> Result<Option<SigningKey>, ClientError> {
     store
         .read()
         .await?
@@ -421,6 +423,35 @@ mod tests {
             let first = client.enroll_device("Acceptance device".into()).await?;
             assert_eq!(first.devices.len(), 1);
             assert!(!first.current_device_id.is_empty());
+            let id = uuid::Uuid::new_v4().to_string();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema_version":2,"operation_id":id,"idempotency_key":id,
+                "device_id":first.current_device_id,"entity_type":"vault_record",
+                "entity_id":"native-transport-acceptance","base_revision":0,
+                "payload":{"algorithm":"aes-256-gcm","key_id":"acceptance-key",
+                "nonce":URL_SAFE_NO_PAD.encode([1;12]),"ciphertext":URL_SAFE_NO_PAD.encode([2;32])}
+            }))
+            .unwrap();
+            let applied = client
+                .sync_request(crate::SyncRequest::Append(body.clone()))
+                .await?;
+            assert_eq!(applied.status, 201);
+            let retry = client
+                .sync_request(crate::SyncRequest::Append(body.clone()))
+                .await?;
+            assert_eq!(retry.status, 201);
+            assert_eq!(retry.body, applied.body);
+            let page = client
+                .sync_request(crate::SyncRequest::Page { after: 0, limit: 2 })
+                .await?;
+            assert_eq!(page.status, 200);
+            let page: crate::sync_wire::SyncPage = serde_json::from_slice(&page.body).unwrap();
+            assert_eq!(page.next_after_seq, 1);
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&page.entries[0].operation).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            );
             let key_before = store.read().await?.unwrap();
             let again = IdentityClient::new(endpoint)?;
             again.refresh().await?;
