@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
@@ -63,21 +63,35 @@ impl NativeSessionStore {
 
     async fn run<T: Send + 'static>(
         &self,
+        event: &'static str,
         action: impl FnOnce(Entry) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
+        let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
+            .map_err(|_| ClientError::TelemetryUnavailable)?;
         let permit = self
             .owner
             .io
             .clone()
             .try_acquire_owned()
-            .map_err(|_| ClientError::Busy)?;
+            .map_err(|_| {
+                span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                    event.name="identity.credential.admission_rejected", error.type="busy", outcome="rejected"
+                }));
+                ClientError::Busy
+            })?;
         let key = self.key.clone();
         let owner = self.owner.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let worker_span = span.clone();
         // The permit stays with the OS call even if its caller times out. Another
         // call cannot create an unbounded queue of non-preemptible native work.
         let work = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                worker_span.in_scope(|| {
             let _permit = permit;
             let _owner = owner;
+            let started = Instant::now();
+            let result = (|| {
             let store = native_store().map_err(|_| ClientError::CredentialStore)?;
             #[cfg(target_os = "ios")]
             let modifiers = Some(HashMap::from([(
@@ -90,24 +104,51 @@ impl NativeSessionStore {
                 .build(SERVICE, &key, modifiers.as_ref())
                 .map_err(|_| ClientError::CredentialStore)?;
             action(entry)
+            })();
+            // This is the actual OS completion, including a late completion
+            // after the waiting caller timed out or was cancelled. No key,
+            // endpoint, value, presence flag or provider error text is emitted.
+            match &result {
+                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
+                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, outcome="ok"
+                }),
+                Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, error.type=error.code(), outcome="error"
+                }),
+            }
+            result
+        })
+            })
         });
-        tokio::time::timeout(Duration::from_secs(15), work)
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|_| ClientError::CredentialStore)?
+        match tokio::time::timeout(Duration::from_secs(15), work).await {
+            Ok(Ok(result)) => result,
+            failed => {
+                let error = if failed.is_err() {
+                    ClientError::Timeout
+                } else {
+                    ClientError::CredentialStore
+                };
+                span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                    event.name="identity.credential.wait_failed", error.type=error.code(), outcome="error"
+                }));
+                Err(error)
+            }
+        }
     }
 
     pub async fn read(&self) -> Result<Option<Zeroizing<Vec<u8>>>, ClientError> {
-        self.run(|entry| match entry.get_secret() {
-            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(_) => Err(ClientError::CredentialStore),
+        self.run("identity.credential.read", |entry| {
+            match entry.get_secret() {
+                Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+                Err(keyring_core::Error::NoEntry) => Ok(None),
+                Err(_) => Err(ClientError::CredentialStore),
+            }
         })
         .await
     }
     pub async fn write(&self, value: &[u8]) -> Result<(), ClientError> {
         let value = Zeroizing::new(value.to_vec());
-        self.run(move |entry| {
+        self.run("identity.credential.write", move |entry| {
             entry
                 .set_secret(&value)
                 .map_err(|_| ClientError::CredentialStore)
@@ -115,9 +156,11 @@ impl NativeSessionStore {
         .await
     }
     pub async fn delete(&self) -> Result<(), ClientError> {
-        self.run(|entry| match entry.delete_credential() {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(_) => Err(ClientError::CredentialStore),
+        self.run("identity.credential.delete", |entry| {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+                Err(_) => Err(ClientError::CredentialStore),
+            }
         })
         .await
     }
