@@ -13,6 +13,7 @@ const SERVICE: &str = "ai.nddev.nds.session.v2";
 
 /// Explicit native backends. No global default store, mock or file fallback.
 pub struct NativeSessionStore {
+    service: &'static str,
     key: String,
     owner: Arc<SessionOwner>,
 }
@@ -45,7 +46,26 @@ impl NativeSessionStore {
             owners.insert(key.clone(), Arc::downgrade(&owner));
             owner
         };
-        Ok(Self { key, owner })
+        Ok(Self {
+            service: SERVICE,
+            key,
+            owner,
+        })
+    }
+
+    /// A separate credential namespace with the same endpoint admission budget.
+    /// Signing keys survive logout and revocation; never delete them as compensation.
+    pub(crate) fn device_store(&self, tenant: &str, user: &str) -> Self {
+        let mut digest = Sha256::new();
+        for value in [&self.key, tenant, user] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        Self {
+            service: "ai.nddev.nds.device.v2",
+            key: format!("{:x}", digest.finalize()),
+            owner: self.owner.clone(),
+        }
     }
 
     pub(crate) fn operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {
@@ -80,6 +100,7 @@ impl NativeSessionStore {
                 ClientError::Busy
             })?;
         let key = self.key.clone();
+        let service = self.service;
         let owner = self.owner.clone();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let worker_span = span.clone();
@@ -104,7 +125,7 @@ impl NativeSessionStore {
             #[cfg(not(target_os = "ios"))]
             let modifiers = None;
             let entry = store
-                .build(SERVICE, &key, modifiers.as_ref())
+                .build(service, &key, modifiers.as_ref())
                 .map_err(|_| ClientError::CredentialStore)?;
             action(entry)
             })();

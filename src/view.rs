@@ -22,6 +22,8 @@ pub enum ClientError {
     RevalidationRequired,
     #[error("challenge_expired")]
     Expired,
+    #[error("device_revoked")]
+    DeviceRevoked,
     #[error("{0}")]
     Server(String),
 }
@@ -36,6 +38,9 @@ impl ClientError {
 /// Presentation state, never a bearer credential or a wire request.
 #[derive(Clone, Default)]
 pub struct View {
+    pub devices: Vec<DeviceView>,
+    pub current_device_id: String,
+    pub devices_checked_at: i64,
     pub email_available: bool,
     pub github_available: bool,
     pub credential_store_ready: bool,
@@ -53,6 +58,17 @@ pub struct View {
     pub verification_code: String,
     pub expires_in_seconds: u32,
     pub retry_after_seconds: u32,
+}
+
+/// Public metadata only; signing keys never cross the presentation boundary.
+#[derive(Clone)]
+pub struct DeviceView {
+    pub device_id: String,
+    pub display_name: String,
+    pub platform: String,
+    pub revoked: bool,
+    pub is_current: bool,
+    pub created_at: String,
 }
 
 impl std::fmt::Debug for View {
