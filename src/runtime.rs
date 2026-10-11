@@ -47,6 +47,8 @@ pub struct Task {
     cancel: futures::future::AbortHandle,
     #[cfg(target_arch = "wasm32")]
     finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_arch = "wasm32")]
+    completion: tokio::sync::oneshot::Receiver<()>,
 }
 impl Task {
     pub fn abort(&self) {
@@ -65,6 +67,14 @@ impl Task {
             self.finished.load(std::sync::atomic::Ordering::Acquire)
         }
     }
+    /// Wait for the owned future to release its operation guards after abort.
+    /// Platform I/O workers retain their own admission through actual completion.
+    pub async fn join(self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.inner.await;
+        #[cfg(target_arch = "wasm32")]
+        let _ = self.completion.await;
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -80,18 +90,26 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> Task {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    struct Completed(Arc<AtomicBool>);
+    struct Completed(Arc<AtomicBool>, Option<tokio::sync::oneshot::Sender<()>>);
     impl Drop for Completed {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
+            if let Some(send) = self.1.take() {
+                let _ = send.send(());
+            }
         }
     }
     let (cancel, registration) = futures::future::AbortHandle::new_pair();
     let finished = Arc::new(AtomicBool::new(false));
-    let completion = Completed(finished.clone());
+    let (send, completion) = tokio::sync::oneshot::channel();
+    let completed = Completed(finished.clone(), Some(send));
     wasm_bindgen_futures::spawn_local(async move {
-        let _completion = completion;
+        let _completion = completed;
         let _ = futures::future::Abortable::new(future, registration).await;
     });
-    Task { cancel, finished }
+    Task {
+        cancel,
+        finished,
+        completion,
+    }
 }
