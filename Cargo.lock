@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.14"
+version = "0.0.1-alpha.15"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1559,8 +1559,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.4"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=3e5b1db049c47799123847c9831f025cb226c69c#3e5b1db049c47799123847c9831f025cb226c69c"
+version = "0.0.5"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=d38b2b8b431430e07a775ad900fe0c460e91575c#d38b2b8b431430e07a775ad900fe0c460e91575c"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -3484,6 +3484,9 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"
