@@ -14,6 +14,7 @@ pub enum SyncRequest {
     },
     VaultKey(Vec<u8>),
     Telemetry(Vec<u8>),
+    NativeTraces(Vec<u8>),
     ObservabilityStatus,
     Incidents {
         after: String,
@@ -52,6 +53,23 @@ impl IdentityClient {
         Ok(self.store.vault_store(&view.tenant_id, &view.user_id))
     }
     pub async fn sync_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
+        use tracing::Instrument;
+        if matches!(
+            &request,
+            SyncRequest::Telemetry(_)
+                | SyncRequest::NativeTraces(_)
+                | SyncRequest::ObservabilityStatus
+                | SyncRequest::Incidents { .. }
+                | SyncRequest::IncidentAction { .. }
+        ) {
+            self.signed_request(request)
+                .instrument(nddev_device_sync_telemetry::delivery_span())
+                .await
+        } else {
+            self.signed_request(request).await
+        }
+    }
+    async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation()?;
         let store = self.device_store()?;
         let view = self.view();
@@ -76,6 +94,12 @@ impl IdentityClient {
                     return Err(ClientError::InvalidInput);
                 }
                 (Method::POST, "/v2/observability/events".into(), Some(body))
+            }
+            SyncRequest::NativeTraces(body) => {
+                if body.is_empty() || body.len() > 65_536 {
+                    return Err(ClientError::InvalidInput);
+                }
+                (Method::POST, "/v2/observability/traces".into(), Some(body))
             }
             SyncRequest::ObservabilityStatus => {
                 (Method::GET, "/v2/observability/status".into(), None)
