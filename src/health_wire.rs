@@ -1,7 +1,7 @@
 // Generated; do not edit. AGPL-3.0-only. NDDev OpenNetwork — https://nddev.ai
 // Source: NDDev-OpenNetwork/nddev-device-sync-protocol/contracts/v1/health-response.schema.json
 // Schema SHA-256: a7eba30691dbdd30bd8adced052bd7ebf38ffb495dfe82f450a59c6cc0690d54
-// Generator script SHA-256: 64d6c1aef18ee0821827739b0e338fef7db9b503b9885f7af1c5145a6b0da98a
+// Generator script SHA-256: 120c57396d8e939c24a876b57a526a07da27fe91ecb81ff894565e43297e0a95
 // Tool: quicktype-core 26.0.0; dependency lock SHA-256: 643e0f2ba88602f4acb9546c401d4838e8e106a9180c0e6f3a760985081bfcf6
 // DTO generation is not schema, authorization or cryptographic validation.
 

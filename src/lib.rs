@@ -2,6 +2,7 @@
 pub mod device_wire;
 mod sync;
 pub mod sync_wire;
+pub mod vault_wire;
 pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
