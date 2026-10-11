@@ -1,3 +1,3 @@
 source_repo = "NDDev-OpenNetwork/nddev-device-sync-protocol"
-source_commit = "dbafb78c3ac133a31e465c9ac68215ee7cae3954"
+source_commit = "11d1904cc80e97c8938868bb1a098ee3fded4c6a"
 schema_version = 2

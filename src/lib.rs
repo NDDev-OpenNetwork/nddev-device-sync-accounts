@@ -391,6 +391,11 @@ impl IdentityClient {
                 return Err(ClientError::InvalidResponse);
             }
             let receipt: wire::PasskeyRevocation = decode(&body)?;
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .passkey_available = receipt.passkey_available;
             if receipt.current_session_revoked {
                 self.clear_session();
                 self.clear_flow();

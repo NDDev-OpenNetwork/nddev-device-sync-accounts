@@ -143,7 +143,11 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         reqwest::StatusCode::OK
     );
     let still_active = restored.revoke_passkey(first_key.clone()).await.unwrap();
-    assert!(still_active.authenticated && still_active.session_verified);
+    assert!(
+        still_active.authenticated
+            && still_active.session_verified
+            && still_active.passkey_available
+    );
     assert_eq!(
         http.get(format!("{endpoint}/v2/session"))
             .bearer_auth(std::str::from_utf8(&first_session).unwrap())
@@ -168,7 +172,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         .revoke_passkey(remaining[0].id.clone())
         .await
         .unwrap();
-    assert!(!revoked.authenticated && !revoked.session_verified);
+    assert!(!revoked.authenticated && !revoked.session_verified && !revoked.passkey_available);
     // Committed revocation invalidates the server session atomically. Ordinary
     // refresh then removes its stale cached bearer without touching device keys.
     let refreshed = restored.refresh().await.unwrap();
