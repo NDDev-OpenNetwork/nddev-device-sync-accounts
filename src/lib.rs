@@ -1,7 +1,9 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
 pub mod device_wire;
+pub mod observability_wire;
 mod sync;
 pub mod sync_wire;
+pub mod telemetry;
 pub mod vault_wire;
 pub use sync::{SyncReply, SyncRequest};
 mod devices;
@@ -48,7 +50,9 @@ enum Flow {
         expires: Instant,
         resend: Instant,
     },
-    Github {
+    Browser {
+        passkey: bool,
+        registration: bool,
         id: String,
         token: Zeroizing<String>,
         expires: Instant,
@@ -109,7 +113,7 @@ impl IdentityClient {
         let now = Instant::now();
         expire_session(&mut state, now, OffsetDateTime::now_utc());
         if state.flow.as_ref().is_some_and(|flow| match flow {
-            Flow::Email { expires, .. } | Flow::Github { expires, .. } => *expires <= now,
+            Flow::Email { expires, .. } | Flow::Browser { expires, .. } => *expires <= now,
         }) {
             clear_flow_state(&mut state);
         }
@@ -119,7 +123,7 @@ impl IdentityClient {
                 Flow::Email {
                     expires, resend, ..
                 } => (*expires, *resend),
-                Flow::Github {
+                Flow::Browser {
                     expires, next_poll, ..
                 } => (*expires, *next_poll),
             };
@@ -178,6 +182,8 @@ impl IdentityClient {
             s.view.email_available =
                 matches!(methods.email_otp, wire::MethodAvailability::Available);
             s.view.github_available = matches!(methods.github, wire::MethodAvailability::Available);
+            s.view.passkey_available =
+                matches!(methods.passkey, wire::MethodAvailability::Available);
         }
         let credential = self.store.read().await;
         self.state
@@ -327,7 +333,9 @@ impl IdentityClient {
         let expires = lifetime(response.expires_in_seconds, 600)?;
         let next_poll = lifetime(response.poll_after_seconds, 30)?;
         self.finish_flow(
-            Flow::Github {
+            Flow::Browser {
+                passkey: false,
+                registration: false,
                 id: response.flow_id,
                 token: Zeroizing::new(response.exchange_token),
                 expires,
@@ -340,6 +348,136 @@ impl IdentityClient {
         Ok(self.view())
     }
 
+    /// Native/browser WebAuthn flow; exchange tokens never leave this module.
+    pub async fn passkeys(&self) -> Result<Vec<view::PasskeyView>, ClientError> {
+        let (_permit, cancel) = self.operation()?;
+        let token = self.session_token().await?;
+        let page: wire::PasskeyList = self.get("/v2/auth/passkeys", Some(&token), &cancel).await?;
+        if page.passkeys.len() > 16 {
+            return Err(ClientError::InvalidResponse);
+        }
+        page.passkeys
+            .into_iter()
+            .map(|key| {
+                if !passkey_id(&key.id) || OffsetDateTime::parse(&key.created_at, &Rfc3339).is_err()
+                {
+                    return Err(ClientError::InvalidResponse);
+                }
+                Ok(view::PasskeyView {
+                    id: key.id,
+                    created_at: key.created_at,
+                })
+            })
+            .collect()
+    }
+    pub async fn revoke_passkey(&self, id: String) -> Result<View, ClientError> {
+        self.observe("identity.passkey.revoke", async {
+            if !passkey_id(&id) {
+                return Err(ClientError::InvalidInput);
+            }
+            let (_permit, cancel) = self.operation()?;
+            let token = self.session_token().await?;
+            let (status, body) = self
+                .request::<()>(
+                    Method::DELETE,
+                    &format!("/v2/auth/passkeys/{id}"),
+                    None,
+                    Some(&token),
+                    "en",
+                    &cancel,
+                )
+                .await?;
+            if status != StatusCode::OK {
+                return Err(ClientError::InvalidResponse);
+            }
+            let receipt: wire::PasskeyRevocation = decode(&body)?;
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .passkey_available = receipt.passkey_available;
+            if receipt.current_session_revoked {
+                self.clear_session();
+                self.clear_flow();
+            }
+            // An invalidated cached token is removed on the next ordinary
+            // refresh. No fallible I/O follows this authoritative receipt.
+            Ok(self.view())
+        })
+        .await
+    }
+    pub async fn start_passkey(
+        &self,
+        registration: bool,
+        locale: &str,
+    ) -> Result<View, ClientError> {
+        self.observe("identity.passkey.start", async {
+            self.require_store_ready()?;
+            let (_permit, cancel) = self.operation()?;
+            let retained = if registration {
+                Some(self.store.read().await?.ok_or(ClientError::Expired)?)
+            } else {
+                None
+            };
+            let token = retained
+                .as_ref()
+                .map(|bytes| std::str::from_utf8(bytes).map_err(|_| ClientError::CredentialStore))
+                .transpose()?;
+            let (status, body) = self
+                .request(
+                    Method::POST,
+                    "/v2/auth/passkeys/start",
+                    Some(&wire::PasskeyRequest { registration }),
+                    token,
+                    locale,
+                    &cancel,
+                )
+                .await?;
+            if status != StatusCode::OK {
+                return Err(ClientError::InvalidResponse);
+            }
+            let response: wire::PasskeyStart = decode(&body)?;
+            let url = Url::parse(&response.authorization_url)
+                .map_err(|_| ClientError::InvalidResponse)?;
+            if url.origin() != self.endpoint.origin()
+                || url.path() != "/v2/auth/passkeys/browser"
+                || url.fragment().is_some()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query() != Some(format!("flow_id={}", response.flow_id).as_str())
+                || !valid_token(&response.exchange_token)
+                || !valid_id(&response.flow_id)
+                || response.verification_code.len() != 8
+                || !response
+                    .verification_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                return Err(ClientError::InvalidResponse);
+            }
+            self.finish_flow(
+                Flow::Browser {
+                    passkey: true,
+                    registration,
+                    id: response.flow_id,
+                    token: Zeroizing::new(response.exchange_token),
+                    expires: lifetime(response.expires_in_seconds, 300)?,
+                    next_poll: lifetime(response.poll_after_seconds, 30)?,
+                },
+                response.authorization_url,
+                response.verification_code,
+                &cancel,
+            )?;
+            Ok(self.view())
+        })
+        .await
+    }
+
+    pub async fn poll_passkey(&self) -> Result<View, ClientError> {
+        self.observe("identity.passkey.poll", self.poll_github_operation())
+            .await
+    }
+
     pub async fn poll_github(&self) -> Result<View, ClientError> {
         self.observe("identity.github.poll", self.poll_github_operation())
             .await
@@ -347,10 +485,12 @@ impl IdentityClient {
 
     async fn poll_github_operation(&self) -> Result<View, ClientError> {
         let (_permit, cancel) = self.operation()?;
-        let request = {
+        let (request, passkey, registration) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &mut s.flow {
-                Some(Flow::Github {
+                Some(Flow::Browser {
+                    passkey,
+                    registration,
                     id,
                     token,
                     expires,
@@ -361,10 +501,14 @@ impl IdentityClient {
                         return Ok(self.view());
                     }
                     *next_poll = Instant::now() + Duration::from_secs(2);
-                    wire::GithubExchangeRequest {
-                        flow_id: id.clone(),
-                        exchange_token: token.to_string(),
-                    }
+                    (
+                        wire::GithubExchangeRequest {
+                            flow_id: id.clone(),
+                            exchange_token: token.to_string(),
+                        },
+                        *passkey,
+                        *registration,
+                    )
                 }
                 _ => return Err(ClientError::Expired),
             }
@@ -372,7 +516,11 @@ impl IdentityClient {
         let result = self
             .request(
                 Method::POST,
-                "/v2/auth/github/exchange",
+                if passkey {
+                    "/v2/auth/passkeys/exchange"
+                } else {
+                    "/v2/auth/github/exchange"
+                },
                 Some(&request),
                 None,
                 "en",
@@ -387,15 +535,38 @@ impl IdentityClient {
             other => other?,
         };
         if status == StatusCode::ACCEPTED {
-            let pending: wire::GithubPending = decode(&body)?;
-            let next = lifetime(pending.retry_after_seconds, 30)?;
-            if let Some(Flow::Github { next_poll, .. }) =
+            let retry = if passkey {
+                let pending: wire::PasskeyStatus = decode(&body)?;
+                if !matches!(pending.status, wire::PasskeyStatusStatus::Pending) {
+                    return Err(ClientError::InvalidResponse);
+                }
+                pending.retry_after_seconds
+            } else {
+                decode::<wire::GithubPending>(&body)?.retry_after_seconds
+            };
+            let next = lifetime(retry, 30)?;
+            if let Some(Flow::Browser { next_poll, .. }) =
                 &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).flow
             {
                 *next_poll = next;
             }
         } else if status == StatusCode::OK {
-            self.accept_session(decode(&body)?, &cancel).await?;
+            if registration {
+                let completion: wire::PasskeyStatus = decode(&body)?;
+                if !matches!(completion.status, wire::PasskeyStatusStatus::Registered)
+                    || completion.retry_after_seconds != 0
+                {
+                    return Err(ClientError::InvalidResponse);
+                }
+                self.clear_flow();
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .view
+                    .passkey_available = true;
+            } else {
+                self.accept_session(decode(&body)?, &cancel).await?;
+            }
         } else {
             return Err(ClientError::InvalidResponse);
         }
@@ -422,7 +593,13 @@ impl IdentityClient {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.view.flow = match &flow {
             Flow::Email { .. } => "email",
-            Flow::Github { .. } => "github",
+            Flow::Browser {
+                passkey: true,
+                registration: true,
+                ..
+            } => "passkey_registration",
+            Flow::Browser { passkey: true, .. } => "passkey",
+            Flow::Browser { .. } => "github",
         }
         .into();
         state.flow = Some(flow);
@@ -525,6 +702,7 @@ impl IdentityClient {
         s.view.auth_method = match session.auth_method {
             wire::AuthMethod::EmailOtp => "email_otp",
             wire::AuthMethod::Github => "github",
+            wire::AuthMethod::Passkey => "passkey",
         }
         .into();
     }
@@ -645,14 +823,20 @@ impl IdentityClient {
             return Err(ClientError::InvalidInput);
         }
         let signed = signature.is_some();
-        let span = nddev_device_sync_telemetry::operation_span("accounts", "http")
-            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        let span = if path.starts_with("/v2/observability/") {
+            tracing::Span::none()
+        } else {
+            nddev_device_sync_telemetry::operation_span("accounts", "http")
+                .map_err(|_| ClientError::TelemetryUnavailable)?
+        };
         let context = nddev_device_sync_telemetry::trace_context(&span);
         // Normalize device paths before recording them; queries and IDs stay out.
         let route = if path.starts_with("/v2/devices/")
             && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
         {
             "/v2/devices/{device_id}"
+        } else if method == Method::DELETE && path.starts_with("/v2/auth/passkeys/") {
+            "/v2/auth/passkeys/{id}"
         } else {
             path.split('?').next().unwrap_or("unknown")
         };
@@ -678,7 +862,7 @@ impl IdentityClient {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
-            request = request.header("content-type","application/json").body(body);
+            request = request.header("content-type", match path { "/v2/observability/events" => "application/x-ndjson", "/v2/observability/traces" => "application/x-protobuf", _ => "application/json" }).body(body);
         }
         if let Some(signature) = signature {
             request = request.header("signature",signature.signature).header("signature-input",signature.signature_input).header("content-digest",signature.content_digest);
@@ -760,6 +944,12 @@ fn clear_flow_state(state: &mut State) {
 
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
     serde_json::from_slice(body).map_err(|_| ClientError::InvalidResponse)
+}
+fn passkey_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -975,7 +1165,9 @@ mod native_completion_tests {
         let (_permit, cancel) = client.operation().unwrap();
         client
             .finish_flow(
-                Flow::Github {
+                Flow::Browser {
+                    passkey: false,
+                    registration: false,
                     id: "ephemeral-flow".into(),
                     token: Zeroizing::new("ephemeral-token".into()),
                     expires: Instant::now(),

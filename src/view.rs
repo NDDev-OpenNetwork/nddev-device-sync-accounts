@@ -43,6 +43,7 @@ pub struct View {
     pub devices_checked_at: i64,
     pub email_available: bool,
     pub github_available: bool,
+    pub passkey_available: bool,
     pub credential_store_ready: bool,
     pub server_version: String,
     pub authenticated: bool,
@@ -83,4 +84,34 @@ impl std::fmt::Debug for View {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Bounded public credential metadata; no verifier/public-key bodies or secrets.
+#[derive(Clone)]
+pub struct PasskeyView {
+    pub id: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportPolicy {
+    #[default]
+    Unknown,
+    Enabled,
+    Disabled,
+}
+#[derive(Clone, Default)]
+pub struct DeliveryView {
+    pub initialized: bool,
+    pub policy: ExportPolicy,
+    pub paused: bool,
+    pub pending: u32,
+    pub delivered: u64,
+    pub dropped: u64,
+    pub failures: u64,
+    pub spans_pending: u32,
+    pub spans_delivered: u64,
+    pub spans_dropped: u64,
+    pub spans_failures: u64,
+    pub last_success_at: u64,
 }
