@@ -61,6 +61,11 @@ mod native {
         let failed = |_| ClientError::CredentialStore;
         let parent = path.parent().ok_or(ClientError::CredentialStore)?;
         std::fs::create_dir_all(parent).map_err(failed)?;
+        // macOS system roots may be aliases (/var -> /private/var). Resolve
+        // the directory while preserving NOFOLLOW for the database itself.
+        let path = std::fs::canonicalize(parent)
+            .map_err(failed)?
+            .join(path.file_name().ok_or(ClientError::CredentialStore)?);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -68,7 +73,7 @@ mod native {
                 .map_err(failed)?;
         }
         let db = Connection::open_with_flags(
-            path,
+            &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -77,7 +82,7 @@ mod native {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .map_err(failed)?;
         }
         db.busy_timeout(Duration::from_millis(500))
@@ -183,6 +188,27 @@ mod native {
             );
             assert!(operate(&db, None).unwrap() == Some(signed_out));
             std::fs::remove_dir_all(path).unwrap();
+        }
+        #[cfg(unix)]
+        #[test]
+        fn directory_alias_is_supported_but_database_symlinks_are_refused() {
+            let root = std::env::temp_dir()
+                .join(format!("nds-owned-fence-alias-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("real")).unwrap();
+            std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+            let path = root.join("alias/authorization.db");
+            operate(
+                &path,
+                Some((None, Fence::new(FenceMode::SignedOut).unwrap())),
+            )
+            .unwrap();
+            std::fs::rename(&path, root.join("real/original.db")).unwrap();
+            std::os::unix::fs::symlink(root.join("real/original.db"), &path).unwrap();
+            assert_eq!(
+                operate(&path, None).err(),
+                Some(ClientError::CredentialStore)
+            );
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }
