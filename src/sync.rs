@@ -71,6 +71,7 @@ impl IdentityClient {
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation().await?;
+        self.authorize_local().await?;
         let store = self.device_store()?;
         let view = self.view();
         let current = view

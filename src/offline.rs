@@ -89,6 +89,16 @@ impl IdentityClient {
             return Ok(None);
         };
         if fence.mode != FenceMode::Ready {
+            if matches!(fence.mode, FenceMode::SignedOut | FenceMode::PendingLogout) {
+                self.clear_session();
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .view
+                    .logout_pending = fence.mode == FenceMode::PendingLogout;
+            } else {
+                self.require_revalidation();
+            }
             return Ok(None);
         }
         let Some(secret) = self.store.offline_store(fence.slot).read().await? else {
@@ -276,7 +286,12 @@ impl IdentityClient {
             || view.user_id != cached.session.user_id
             || view.tenant_id != cached.session.tenant_id
             || view.current_device_id != cached.device.device_id
+            || !view
+                .devices
+                .iter()
+                .any(|device| device.is_current && !device.revoked)
         {
+            self.require_revalidation();
             return Err(ClientError::RevalidationRequired);
         }
         Ok(())
@@ -448,6 +463,12 @@ mod acceptance {
                 client.authorize_local().await.is_err(),
                 "another client retained local access after logout"
             );
+            assert!(matches!(
+                client
+                    .sync_request(crate::SyncRequest::Page { after: 0, limit: 1 })
+                    .await,
+                Err(ClientError::RevalidationRequired)
+            ));
             let closed = IdentityClient::new(endpoint).unwrap();
             assert!(closed.refresh().await.is_err());
             assert!(!closed.view().authenticated);

@@ -419,7 +419,13 @@ impl IdentityClient {
             }
             let (_permit, cancel) = self.operation().await?;
             let token = self.session_credential().await?;
-            let (status, body) = self
+            // The chosen passkey may own this session. Block cached access
+            // before the mutation; a lost response cannot revive that session.
+            let previous=self.store.authorization_fence(None).await?;
+            let pending=store::Fence::new(store::FenceMode::Checking)?;
+            self.store.authorization_fence(Some((previous.clone(),pending.clone()))).await?;
+            {let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());state.view.offline_authorized=false;state.view.offline_cache_ready=false;}
+            let response = self
                 .request::<()>(
                     Method::DELETE,
                     &format!("/v2/auth/passkeys/{id}"),
@@ -428,7 +434,16 @@ impl IdentityClient {
                     "en",
                     &cancel,
                 )
-                .await?;
+                .await;
+            let (status,body)=match response {
+                Ok(value)=>value,
+                Err(error)=>{
+                    if matches!(&error,ClientError::Server(code) if code=="recent_authentication_required") {
+                        self.restore_passkey_authorization(previous,pending).await?;
+                    }
+                    return Err(error);
+                }
+            };
             if status != StatusCode::OK {
                 return Err(ClientError::InvalidResponse);
             }
@@ -441,12 +456,31 @@ impl IdentityClient {
             if receipt.current_session_revoked {
                 self.clear_session();
                 self.clear_flow();
+            } else if self.restore_passkey_authorization(previous,pending).await.is_err() {
+                tracing::event!(target:"nds_accounts",tracing::Level::WARN,{event.name="identity.offline.restore_failed",error.type="credential_store_unavailable",outcome="error"});
             }
             // An invalidated cached token is removed on the next ordinary
             // refresh. No fallible I/O follows this authoritative receipt.
             Ok(self.view())
         })
         .await
+    }
+    async fn restore_passkey_authorization(
+        &self,
+        previous: Option<store::Fence>,
+        pending: store::Fence,
+    ) -> Result<(), ClientError> {
+        if let Some(previous) = previous {
+            self.store
+                .authorization_fence(Some((Some(pending), previous.clone())))
+                .await?;
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.view.offline_cache_ready = previous.mode == store::FenceMode::Ready;
+            state.view.offline_authorized = state.view.offline_cache_ready
+                && state.view.authenticated
+                && !state.view.session_verified;
+        }
+        Ok(())
     }
     pub async fn start_passkey(
         &self,
