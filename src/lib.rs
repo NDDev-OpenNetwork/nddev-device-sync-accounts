@@ -717,6 +717,12 @@ impl IdentityClient {
                 if token.is_some() && code.as_str() == Some("authentication_failed") {
                     self.require_revalidation();
                 }
+                if token.is_some() && code.as_str() == Some("device_revoked") {
+                    for device in &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).view.devices {
+                        if device.is_current { device.revoked = true; }
+                    }
+                    return Err(ClientError::DeviceRevoked);
+                }
                 return Err(ClientError::Server(
                     code.as_str()
                         .ok_or(ClientError::InvalidResponse)?
