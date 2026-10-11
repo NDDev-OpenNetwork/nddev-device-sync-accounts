@@ -21,14 +21,28 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     );
     let client = IdentityClient::new(endpoint).unwrap();
     assert!(!client.refresh().await.unwrap().authenticated);
-    client
-        .request_email(receipt["owner_email"].as_str().unwrap().into(), "en")
-        .await
-        .unwrap();
     let http = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
+        .unwrap();
+    let before: Value = http
+        .get(format!("{mailbox}/api/v1/messages"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let before: Vec<String> = before["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["ID"].as_str().map(str::to_owned))
+        .collect();
+    client
+        .request_email(receipt["owner_email"].as_str().unwrap().into(), "en")
+        .await
         .unwrap();
     let otp = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -45,6 +59,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
                 .unwrap()
                 .first()
                 .and_then(|message| message["ID"].as_str())
+                .filter(|id| !before.iter().any(|previous| previous == id))
             {
                 let message: Value = http
                     .get(format!("{mailbox}/api/v1/message/{id}"))
@@ -65,7 +80,11 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     .unwrap();
     let initial = client.verify_email(otp).await.unwrap();
     let owner = (initial.user_id, initial.tenant_id);
-    for registration in [true, false] {
+    let native = NativeSessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
+    let otp_session = native.read().await.unwrap().unwrap();
+    let mut first_key = String::new();
+    let mut first_session = None;
+    for (phase, registration) in [true, false, true, false].into_iter().enumerate() {
         let view = client.start_passkey(registration, "en").await.unwrap();
         let mut file = std::fs::OpenOptions::new();
         file.write(true).create_new(true);
@@ -76,7 +95,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         }
         let mut file = file.open(&handoff).unwrap();
         use std::io::Write;
-        file.write_all(serde_json::to_string(&serde_json::json!({"authorization_url":view.authorization_url,"verification_code":view.verification_code,"registration":registration})).unwrap().as_bytes()).unwrap();
+        file.write_all(serde_json::to_string(&serde_json::json!({"authorization_url":view.authorization_url,"verification_code":view.verification_code,"registration":registration,"phase":phase})).unwrap().as_bytes()).unwrap();
         tokio::time::timeout(Duration::from_secs(300), async {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -94,8 +113,11 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         .await
         .unwrap();
         std::fs::remove_file(&handoff).unwrap();
-        if registration {
-            client.logout().await.unwrap();
+        if phase == 0 {
+            first_key = client.passkeys().await.unwrap()[0].id.clone();
+        }
+        if phase == 1 {
+            first_session = Some(native.read().await.unwrap().unwrap());
         }
     }
     client
@@ -108,8 +130,51 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     assert_eq!(view.auth_method, "passkey");
     let native = NativeSessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
     let token = native.read().await.unwrap().unwrap();
-    restored.logout().await.unwrap();
+    let keys = restored.passkeys().await.unwrap();
+    assert_eq!(keys.len(), 2);
+    let first_session = first_session.unwrap();
+    assert_eq!(
+        http.get(format!("{endpoint}/v2/session"))
+            .bearer_auth(std::str::from_utf8(&first_session).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let still_active = restored.revoke_passkey(first_key.clone()).await.unwrap();
+    assert!(still_active.authenticated && still_active.session_verified);
+    assert_eq!(
+        http.get(format!("{endpoint}/v2/session"))
+            .bearer_auth(std::str::from_utf8(&first_session).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let remaining = restored.passkeys().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_ne!(remaining[0].id, first_key);
+    // Missing fingerprints are idempotently absent under the still-valid login.
+    assert!(
+        restored
+            .revoke_passkey(first_key)
+            .await
+            .unwrap()
+            .authenticated
+    );
+    let revoked = restored
+        .revoke_passkey(remaining[0].id.clone())
+        .await
+        .unwrap();
+    assert!(!revoked.authenticated && !revoked.session_verified);
+    // Committed revocation invalidates the server session atomically. Ordinary
+    // refresh then removes its stale cached bearer without touching device keys.
+    let refreshed = restored.refresh().await.unwrap();
+    assert!(!refreshed.authenticated && !refreshed.passkey_available);
     assert!(native.read().await.unwrap().is_none());
+    assert!(restored.start_passkey(false, "en").await.is_err());
     assert_eq!(
         http.get(format!("{endpoint}/v2/session"))
             .bearer_auth(std::str::from_utf8(&token).unwrap())
@@ -118,5 +183,24 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
             .unwrap()
             .status(),
         reqwest::StatusCode::UNAUTHORIZED
+    );
+    // Removing both passkeys must not revoke a session established by OTP.
+    assert_eq!(
+        http.get(format!("{endpoint}/v2/session"))
+            .bearer_auth(std::str::from_utf8(&otp_session).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        http.delete(format!("{endpoint}/v2/session"))
+            .bearer_auth(std::str::from_utf8(&otp_session).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
     );
 }

@@ -85,3 +85,10 @@ impl std::fmt::Debug for View {
             .finish_non_exhaustive()
     }
 }
+
+/// Bounded public credential metadata; no verifier/public-key bodies or secrets.
+#[derive(Clone)]
+pub struct PasskeyView {
+    pub id: String,
+    pub created_at: String,
+}
