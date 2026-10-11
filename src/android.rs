@@ -63,3 +63,19 @@ pub fn initialize_tls<'local>(
         .with_env(|env| rustls_platform_verifier::android::init_with_env(env, context))
         .resolve::<ThrowRuntimeExAndDefault>();
 }
+
+/// Borrow the one app-owned JNI context for native OS adapters. The closure may
+/// return only owned Rust data; local JNI references cannot escape this scope.
+pub fn with_application_context<T>(
+    work: impl for<'local> FnOnce(
+        &mut jni_legacy::JNIEnv<'local>,
+        &jni_legacy::objects::JObject<'static>,
+    ) -> Result<T, crate::ClientError>,
+) -> Result<T, crate::ClientError> {
+    let context = CONTEXT.get().ok_or(crate::ClientError::CredentialStore)?;
+    let mut env = context
+        .vm
+        .attach_current_thread()
+        .map_err(|_| crate::ClientError::CredentialStore)?;
+    work(&mut env, context.application.as_obj())
+}
