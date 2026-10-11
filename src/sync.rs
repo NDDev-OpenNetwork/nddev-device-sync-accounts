@@ -9,6 +9,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 pub enum SyncRequest {
     Append(Vec<u8>),
     Page { after: u64, limit: u16 },
+    VaultKey(Vec<u8>),
 }
 pub struct SyncReply {
     pub status: u16,
@@ -57,6 +58,12 @@ impl IdentityClient {
         };
         let token = self.session_token().await?;
         let (method, path, body) = match request {
+            SyncRequest::VaultKey(body) => {
+                if body.len() > 1024 {
+                    return Err(ClientError::InvalidInput);
+                }
+                (Method::POST, "/v2/vault/key".into(), Some(body))
+            }
             SyncRequest::Append(body) => {
                 if body.len() > nddev_device_sync_domain::sync::MAX_OPERATION_BYTES {
                     return Err(ClientError::InvalidInput);
@@ -114,5 +121,47 @@ impl IdentityClient {
             status: status.as_u16(),
             body,
         })
+    }
+
+    /// Privileged native provisioning only. Root keys never enter View or FFI.
+    pub async fn ensure_vault_key(
+        &self,
+        existing: Option<&nddev_device_sync_domain::vault::KeyMaterial>,
+    ) -> Result<nddev_device_sync_domain::vault::KeyMaterial, ClientError> {
+        use zeroize::{Zeroize, Zeroizing};
+        let mut request = crate::vault_wire::VaultKeyRequest {
+            existing_key: existing.map(|key| crate::vault_wire::VaultKey {
+                key_id: key.id(),
+                key_material: URL_SAFE_NO_PAD.encode(key.expose()),
+            }),
+        };
+        let body = serde_json::to_vec(&request).map_err(|_| ClientError::InvalidInput);
+        if let Some(key) = &mut request.existing_key {
+            key.key_material.zeroize();
+        }
+        let reply = self.sync_request(SyncRequest::VaultKey(body?)).await?;
+        let bytes = Zeroizing::new(reply.body);
+        if bytes.len() > 1024 {
+            return Err(ClientError::InvalidResponse);
+        }
+        let status = reply.status;
+        let reply: crate::vault_wire::VaultKey =
+            serde_json::from_slice(&bytes).map_err(|_| ClientError::InvalidResponse)?;
+        let encoded = Zeroizing::new(reply.key_material);
+        let bytes = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(encoded.as_bytes())
+                .map_err(|_| ClientError::InvalidResponse)?,
+        );
+        let key = nddev_device_sync_domain::vault::KeyMaterial::new(bytes.as_slice())
+            .map_err(|_| ClientError::InvalidResponse)?;
+        if status != 200
+            || encoded.len() != 64
+            || URL_SAFE_NO_PAD.encode(bytes.as_slice()) != encoded.as_str()
+            || key.id() != reply.key_id
+        {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(key)
     }
 }

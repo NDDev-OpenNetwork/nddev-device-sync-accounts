@@ -55,6 +55,25 @@ impl IdentityClient {
         .await
     }
 
+    /// Sign-in prepares this installation automatically. Retained revoked
+    /// signing keys are never replaced or re-enrolled as compensation.
+    pub async fn prepare_device(&self, name: String) -> Result<View, ClientError> {
+        let view = self.refresh_devices().await?;
+        if let Some(current) = view.devices.iter().find(|device| device.is_current) {
+            return if current.revoked {
+                Err(ClientError::DeviceRevoked)
+            } else {
+                Ok(view)
+            };
+        }
+        let name = if name.trim().is_empty() {
+            format!("NDS {}", platform_name(&platform()))
+        } else {
+            name
+        };
+        self.enroll_device(name).await
+    }
+
     pub async fn enroll_device(&self, name: String) -> Result<View, ClientError> {
         DeviceName::new(name.clone()).map_err(|_| ClientError::InvalidInput)?;
         self.observe("device.enrollment", async {

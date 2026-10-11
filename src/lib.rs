@@ -2,6 +2,7 @@
 pub mod device_wire;
 mod sync;
 pub mod sync_wire;
+pub mod vault_wire;
 pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
@@ -715,6 +716,12 @@ impl IdentityClient {
                     .map_err(|_| ClientError::InvalidResponse)?;
                 if token.is_some() && code.as_str() == Some("authentication_failed") {
                     self.require_revalidation();
+                }
+                if token.is_some() && code.as_str() == Some("device_revoked") {
+                    for device in &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).view.devices {
+                        if device.is_current { device.revoked = true; }
+                    }
+                    return Err(ClientError::DeviceRevoked);
                 }
                 return Err(ClientError::Server(
                     code.as_str()
