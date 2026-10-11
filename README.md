@@ -41,3 +41,11 @@ server and observability fixture receipts through `NDS_FIXTURE_RECEIPT` and
 HTTP, PostgreSQL, Vector and searchable OpenObserve spans, incident replay and
 resolution, background/resume and absence of recursive export. Fixture credentials
 and generated identities remain outside public source.
+
+Owners can list passkey fingerprints/registration times and remove a credential
+through the native client. Removal requires a fresh server-verified session and
+returns the committed current-session revocation result directly. A subsequent
+ordinary refresh removes a revoked cached bearer; vault and device keys persist.
+The browser acceptance exercises two actual virtual authenticators, selective
+credential/session revocation, idempotent absence, and preservation of OTP login.
+Physical authenticator qualification is separate.

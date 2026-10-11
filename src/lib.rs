@@ -349,6 +349,63 @@ impl IdentityClient {
     }
 
     /// Native/browser WebAuthn flow; exchange tokens never leave this module.
+    pub async fn passkeys(&self) -> Result<Vec<view::PasskeyView>, ClientError> {
+        let (_permit, cancel) = self.operation()?;
+        let token = self.session_token().await?;
+        let page: wire::PasskeyList = self.get("/v2/auth/passkeys", Some(&token), &cancel).await?;
+        if page.passkeys.len() > 16 {
+            return Err(ClientError::InvalidResponse);
+        }
+        page.passkeys
+            .into_iter()
+            .map(|key| {
+                if !passkey_id(&key.id) || OffsetDateTime::parse(&key.created_at, &Rfc3339).is_err()
+                {
+                    return Err(ClientError::InvalidResponse);
+                }
+                Ok(view::PasskeyView {
+                    id: key.id,
+                    created_at: key.created_at,
+                })
+            })
+            .collect()
+    }
+    pub async fn revoke_passkey(&self, id: String) -> Result<View, ClientError> {
+        self.observe("identity.passkey.revoke", async {
+            if !passkey_id(&id) {
+                return Err(ClientError::InvalidInput);
+            }
+            let (_permit, cancel) = self.operation()?;
+            let token = self.session_token().await?;
+            let (status, body) = self
+                .request::<()>(
+                    Method::DELETE,
+                    &format!("/v2/auth/passkeys/{id}"),
+                    None,
+                    Some(&token),
+                    "en",
+                    &cancel,
+                )
+                .await?;
+            if status != StatusCode::OK {
+                return Err(ClientError::InvalidResponse);
+            }
+            let receipt: wire::PasskeyRevocation = decode(&body)?;
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .passkey_available = receipt.passkey_available;
+            if receipt.current_session_revoked {
+                self.clear_session();
+                self.clear_flow();
+            }
+            // An invalidated cached token is removed on the next ordinary
+            // refresh. No fallible I/O follows this authoritative receipt.
+            Ok(self.view())
+        })
+        .await
+    }
     pub async fn start_passkey(
         &self,
         registration: bool,
@@ -778,6 +835,8 @@ impl IdentityClient {
             && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
         {
             "/v2/devices/{device_id}"
+        } else if method == Method::DELETE && path.starts_with("/v2/auth/passkeys/") {
+            "/v2/auth/passkeys/{id}"
         } else {
             path.split('?').next().unwrap_or("unknown")
         };
@@ -885,6 +944,12 @@ fn clear_flow_state(state: &mut State) {
 
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
     serde_json::from_slice(body).map_err(|_| ClientError::InvalidResponse)
+}
+fn passkey_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
