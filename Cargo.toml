@@ -16,7 +16,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
 keyring-core = "1.0.0"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "68796bbd0108ea99f1deca5a4b8d30c80b7e5c82" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "1f559375dbaa2cebcc746e8b4f122e5f3c7c0a47" }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
