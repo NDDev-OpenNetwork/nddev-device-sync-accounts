@@ -92,3 +92,26 @@ pub struct PasskeyView {
     pub id: String,
     pub created_at: String,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportPolicy {
+    #[default]
+    Unknown,
+    Enabled,
+    Disabled,
+}
+#[derive(Clone, Default)]
+pub struct DeliveryView {
+    pub initialized: bool,
+    pub policy: ExportPolicy,
+    pub paused: bool,
+    pub pending: u32,
+    pub delivered: u64,
+    pub dropped: u64,
+    pub failures: u64,
+    pub spans_pending: u32,
+    pub spans_delivered: u64,
+    pub spans_dropped: u64,
+    pub spans_failures: u64,
+    pub last_success_at: u64,
+}
