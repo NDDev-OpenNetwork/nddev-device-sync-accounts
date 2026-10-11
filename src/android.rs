@@ -77,5 +77,8 @@ pub fn with_application_context<T>(
         .vm
         .attach_current_thread()
         .map_err(|_| crate::ClientError::CredentialStore)?;
-    work(&mut env, context.application.as_obj())
+    env.with_local_frame(64, |env| {
+        Ok::<_, jni_legacy::errors::Error>(work(env, context.application.as_obj()))
+    })
+    .map_err(|_| crate::ClientError::CredentialStore)?
 }
