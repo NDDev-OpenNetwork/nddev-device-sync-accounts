@@ -173,7 +173,7 @@ impl IdentityClient {
         }
         self.observe("device.revocation", async {
             let (_permit, cancel) = self.operation()?;
-            let store = self.device_store()?;
+            self.device_store()?;
             self.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -193,12 +193,20 @@ impl IdentityClient {
             if status != StatusCode::NO_CONTENT {
                 return Err(ClientError::InvalidResponse);
             }
-            let key = read_key(&store).await?;
-            let public = key
-                .as_ref()
-                .map(|key| URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()));
-            self.update_devices(&token, public.as_deref(), &cancel)
-                .await
+            // The server has committed the revocation. Apply that receipt
+            // directly; later keyring/inventory I/O cannot undo its success.
+            if let Some(device) = self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .devices
+                .iter_mut()
+                .find(|device| device.device_id == id)
+            {
+                device.revoked = true;
+            }
+            Ok(self.view())
         })
         .await
     }
