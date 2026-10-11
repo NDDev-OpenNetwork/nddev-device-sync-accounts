@@ -8,8 +8,21 @@ use ring::rand::{SecureRandom, SystemRandom};
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
 pub enum SyncRequest {
     Append(Vec<u8>),
-    Page { after: u64, limit: u16 },
+    Page {
+        after: u64,
+        limit: u16,
+    },
     VaultKey(Vec<u8>),
+    Telemetry(Vec<u8>),
+    ObservabilityStatus,
+    Incidents {
+        after: String,
+    },
+    IncidentAction {
+        id: String,
+        silence: bool,
+        body: Vec<u8>,
+    },
 }
 pub struct SyncReply {
     pub status: u16,
@@ -58,6 +71,36 @@ impl IdentityClient {
         };
         let token = self.session_token().await?;
         let (method, path, body) = match request {
+            SyncRequest::Telemetry(body) => {
+                if body.is_empty() || body.len() > 65_536 {
+                    return Err(ClientError::InvalidInput);
+                }
+                (Method::POST, "/v2/observability/events".into(), Some(body))
+            }
+            SyncRequest::ObservabilityStatus => {
+                (Method::GET, "/v2/observability/status".into(), None)
+            }
+            SyncRequest::Incidents { after } => {
+                if after.len() > 128 || !after.is_empty() && !crate::valid_id(&after) {
+                    return Err(ClientError::InvalidInput);
+                }
+                (
+                    Method::GET,
+                    format!("/v2/observability/incidents?after={after}"),
+                    None,
+                )
+            }
+            SyncRequest::IncidentAction { id, silence, body } => {
+                if !crate::valid_id(&id) || body.len() > 1024 {
+                    return Err(ClientError::InvalidInput);
+                }
+                let action = if silence { "silence" } else { "acknowledge" };
+                (
+                    Method::POST,
+                    format!("/v2/observability/incidents/{id}/{action}"),
+                    Some(body),
+                )
+            }
             SyncRequest::VaultKey(body) => {
                 if body.len() > 1024 {
                     return Err(ClientError::InvalidInput);

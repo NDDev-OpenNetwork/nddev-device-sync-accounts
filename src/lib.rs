@@ -1,5 +1,6 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
 pub mod device_wire;
+pub mod observability_wire;
 mod sync;
 pub mod sync_wire;
 pub mod vault_wire;
@@ -764,8 +765,12 @@ impl IdentityClient {
             return Err(ClientError::InvalidInput);
         }
         let signed = signature.is_some();
-        let span = nddev_device_sync_telemetry::operation_span("accounts", "http")
-            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        let span = if path.starts_with("/v2/observability/") {
+            tracing::Span::none()
+        } else {
+            nddev_device_sync_telemetry::operation_span("accounts", "http")
+                .map_err(|_| ClientError::TelemetryUnavailable)?
+        };
         let context = nddev_device_sync_telemetry::trace_context(&span);
         // Normalize device paths before recording them; queries and IDs stay out.
         let route = if path.starts_with("/v2/devices/")
@@ -797,7 +802,7 @@ impl IdentityClient {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
-            request = request.header("content-type","application/json").body(body);
+            request = request.header("content-type", if path == "/v2/observability/events" {"application/x-ndjson"} else {"application/json"}).body(body);
         }
         if let Some(signature) = signature {
             request = request.header("signature",signature.signature).header("signature-input",signature.signature_input).header("content-digest",signature.content_digest);
