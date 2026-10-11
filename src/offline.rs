@@ -440,6 +440,10 @@ mod acceptance {
                     && enrolled.session_verified
                     && !enrolled.offline_authorized
             );
+            let refreshed=client.refresh().await.unwrap();
+            assert_eq!(refreshed.current_device_id,enrolled.current_device_id);
+            assert_eq!(refreshed.devices_checked_at,enrolled.devices_checked_at);
+            client.authorize_local().await.unwrap();
             let key = client
                 .device_store()
                 .unwrap()
