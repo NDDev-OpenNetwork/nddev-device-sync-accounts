@@ -3,6 +3,7 @@ pub mod device_wire;
 pub mod observability_wire;
 mod sync;
 pub mod sync_wire;
+pub mod telemetry;
 pub mod vault_wire;
 pub use sync::{SyncReply, SyncRequest};
 mod devices;
@@ -802,7 +803,7 @@ impl IdentityClient {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
-            request = request.header("content-type", if path == "/v2/observability/events" {"application/x-ndjson"} else {"application/json"}).body(body);
+            request = request.header("content-type", match path { "/v2/observability/events" => "application/x-ndjson", "/v2/observability/traces" => "application/x-protobuf", _ => "application/json" }).body(body);
         }
         if let Some(signature) = signature {
             request = request.header("signature",signature.signature).header("signature-input",signature.signature_input).header("content-digest",signature.content_digest);

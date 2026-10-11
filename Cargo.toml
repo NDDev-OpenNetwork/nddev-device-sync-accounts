@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.15"
+version = "0.0.1-alpha.16"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -11,12 +11,12 @@ default = []
 development-http = []
 
 [dependencies]
-nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "65f3032fc5c0f111f8a34f2d697d83181474082f" }
+nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "3e5cbe56a3a810e3b7c7f16f0dc1f67a63ab1ac2" }
 base64 = "0.22"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
 keyring-core = "1.0.0"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "1f559375dbaa2cebcc746e8b4f122e5f3c7c0a47" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d08e6b34c9ff6af1fdc179291f5386ec73c84926" }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +27,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "e9d9d36227a392a375c3125d7bdc4de01816ff2e" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "e4ed307b5e4de93aca369673aaca270baddea6b7", features = ["client-traces"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -52,4 +52,4 @@ jni-legacy = { package = "jni", version = "0.21.1" }
 rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
-uuid = { version = "1.27", features = ["v4"] }
+uuid = { version = "1.27", features = ["v4", "v7"] }
