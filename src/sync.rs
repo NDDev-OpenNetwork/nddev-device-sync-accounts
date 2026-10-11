@@ -1,8 +1,8 @@
 use crate::{ClientError, IdentityClient, WireRequest};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::Signer;
+use http::Method;
 use nddev_device_sync_http_signatures as signatures;
-use reqwest::Method;
 use ring::rand::{SecureRandom, SystemRandom};
 
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
@@ -47,7 +47,7 @@ impl signatures::SigningKey for Key {
 impl IdentityClient {
     /// Native consumers only. This namespace never appears in the FFI surface;
     /// vault keys survive sign-out and are separate from device signing keys.
-    pub fn vault_credentials(&self) -> Result<crate::NativeSessionStore, ClientError> {
+    pub fn vault_credentials(&self) -> Result<crate::SessionStore, ClientError> {
         self.device_store()?;
         let view = self.view();
         Ok(self.store.vault_store(&view.tenant_id, &view.user_id))
@@ -70,7 +70,7 @@ impl IdentityClient {
         }
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
         let store = self.device_store()?;
         let view = self.view();
         let current = view
@@ -87,7 +87,7 @@ impl IdentityClient {
                 .ok_or(ClientError::RevalidationRequired)?,
             id: current.device_id.clone(),
         };
-        let token = self.session_token().await?;
+        let token = self.session_credential().await?;
         let (method, path, body) = match request {
             SyncRequest::Telemetry(body) => {
                 if body.is_empty() || body.len() > 65_536 {

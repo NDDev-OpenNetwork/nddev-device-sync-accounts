@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.17"
+version = "0.0.1-alpha.18"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -11,23 +11,21 @@ default = []
 development-http = []
 
 [dependencies]
-nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "11d1904cc80e97c8938868bb1a098ee3fded4c6a" }
+http = "1"
+nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "2d02bfca16266e7c343b024807362c7cbbf8f7c6" }
 base64 = "0.22"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
-keyring-core = "1.0.0"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d08e6b34c9ff6af1fdc179291f5386ec73c84926" }
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "fbe50f9994dde44f26ba803ac82c5d2ecfa1cacd" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["parsing", "formatting"] }
-tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.53", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "469a77aea2e234b50d0554625a761d52985e7cb0", features = ["client-traces"] }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "f3a7c16d0df0f0dc3912284db2e97d6894aaf5a0", features = ["client-traces"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -52,4 +50,25 @@ jni-legacy = { package = "jni", version = "0.21.1" }
 rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
+futures = "0.3"
 uuid = { version = "1.27", features = ["v4", "v7"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ring = {version="0.17", features=["wasm32_unknown_unknown_js"]}
+time = {version="0.3", features=["wasm-bindgen"]}
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+js-sys = "=0.3.106"
+web-time = "1.1"
+futures = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
+keyring-core = "1.0.0"
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,19 +1,28 @@
 use crate::ClientError;
+#[cfg(not(target_arch = "wasm32"))]
 use keyring_core::{CredentialStore, Entry};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
+#[cfg(target_arch = "wasm32")]
+mod browser;
+mod fence;
+pub(crate) use fence::{Fence, FenceMode};
+mod admission;
+pub(crate) use admission::OperationPermit;
+
 const SERVICE: &str = "ai.nddev.nds.session.v2";
 
-/// Explicit native backends. No global default store, mock or file fallback.
+/// Explicit platform credential backends; no plaintext or metadata fallback.
 #[derive(Clone)]
-pub struct NativeSessionStore {
+pub struct SessionStore {
     service: &'static str,
     key: String,
     owner: Arc<SessionOwner>,
@@ -22,10 +31,11 @@ pub struct NativeSessionStore {
 struct SessionOwner {
     io: Arc<Semaphore>,
     operation: Arc<Semaphore>,
+    lease: Mutex<Weak<admission::Lease>>,
 }
 static OWNERS: OnceLock<Mutex<HashMap<String, Weak<SessionOwner>>>> = OnceLock::new();
 
-impl NativeSessionStore {
+impl SessionStore {
     pub fn for_endpoint(endpoint: &str) -> Result<Self, ClientError> {
         let endpoint = crate::validate_endpoint(endpoint)?;
         let key = format!("{:x}", Sha256::digest(endpoint.as_str().as_bytes()));
@@ -43,6 +53,7 @@ impl NativeSessionStore {
             let owner = Arc::new(SessionOwner {
                 io: Arc::new(Semaphore::new(1)),
                 operation: Arc::new(Semaphore::new(1)),
+                lease: Mutex::default(),
             });
             owners.insert(key.clone(), Arc::downgrade(&owner));
             owner
@@ -75,6 +86,16 @@ impl NativeSessionStore {
         store
     }
 
+    pub(crate) fn offline_store(&self, slot: u8) -> Self {
+        let mut store = self.clone();
+        store.service = "ai.nddev.nds.offline.v1";
+        store.key = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:offline:{slot}", self.key))
+        );
+        store
+    }
+
     pub(crate) fn operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {
         let permit = self
             .owner
@@ -88,10 +109,11 @@ impl NativeSessionStore {
         Ok(permit)
     }
 
-    async fn run<T: Send + 'static>(
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn run_io<T: Send + 'static>(
         &self,
         event: &'static str,
-        action: impl FnOnce(Entry) -> Result<T, ClientError> + Send + 'static,
+        action: impl FnOnce(&'static str, &str) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
         let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
             .map_err(|_| ClientError::TelemetryUnavailable)?;
@@ -109,6 +131,11 @@ impl NativeSessionStore {
         let key = self.key.clone();
         let service = self.service;
         let owner = self.owner.clone();
+        let lease = owner
+            .lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let worker_span = span.clone();
         // The permit stays with the OS call even if its caller times out. Another
@@ -118,24 +145,12 @@ impl NativeSessionStore {
                 worker_span.in_scope(|| {
             let _permit = permit;
             let _owner = owner;
+            let _lease = lease;
             let started = Instant::now();
                     tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
                         event.name=event, outcome="started"
                     });
-            let result = (|| {
-            let store = native_store().map_err(|_| ClientError::CredentialStore)?;
-            #[cfg(target_os = "ios")]
-            let modifiers = Some(HashMap::from([(
-                "access-policy",
-                "when-unlocked-this-device-only",
-            )]));
-            #[cfg(not(target_os = "ios"))]
-            let modifiers = None;
-            let entry = store
-                .build(service, &key, modifiers.as_ref())
-                .map_err(|_| ClientError::CredentialStore)?;
-            action(entry)
-            })();
+            let result = action(service, &key);
             // This is the actual OS completion, including a late completion
             // after the waiting caller timed out or was cancelled. No key,
             // endpoint, value, presence flag or provider error text is emitted.
@@ -167,6 +182,30 @@ impl NativeSessionStore {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn run<T: Send + 'static>(
+        &self,
+        event: &'static str,
+        action: impl FnOnce(Entry) -> Result<T, ClientError> + Send + 'static,
+    ) -> Result<T, ClientError> {
+        self.run_io(event, move |service, key| {
+            let store = native_store().map_err(|_| ClientError::CredentialStore)?;
+            #[cfg(target_os = "ios")]
+            let modifiers = Some(HashMap::from([(
+                "access-policy",
+                "when-unlocked-this-device-only",
+            )]));
+            #[cfg(not(target_os = "ios"))]
+            let modifiers = None;
+            let entry = store
+                .build(service, key, modifiers.as_ref())
+                .map_err(|_| ClientError::CredentialStore)?;
+            action(entry)
+        })
+        .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn read(&self) -> Result<Option<Zeroizing<Vec<u8>>>, ClientError> {
         self.run("identity.credential.read", |entry| {
             match entry.get_secret() {
@@ -177,6 +216,7 @@ impl NativeSessionStore {
         })
         .await
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn write(&self, value: &[u8]) -> Result<(), ClientError> {
         let value = Zeroizing::new(value.to_vec());
         self.run("identity.credential.write", move |entry| {
@@ -186,6 +226,7 @@ impl NativeSessionStore {
         })
         .await
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn delete(&self) -> Result<(), ClientError> {
         self.run("identity.credential.delete", |entry| {
             match entry.delete_credential() {
@@ -197,6 +238,7 @@ impl NativeSessionStore {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn native_store() -> keyring_core::Result<Arc<CredentialStore>> {
     #[cfg(target_os = "linux")]
     {

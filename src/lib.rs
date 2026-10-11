@@ -8,22 +8,27 @@ pub mod vault_wire;
 pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
+mod offline;
+pub mod runtime;
 mod store;
+mod transport;
+use runtime::Instant;
 pub mod wire;
-pub use store::NativeSessionStore;
+pub use store::SessionStore;
+#[cfg(not(target_arch = "wasm32"))]
+mod paths;
+#[cfg(not(target_arch = "wasm32"))]
+pub use paths::private_data_directory;
 #[cfg(target_os = "android")]
 pub mod android;
 
+use http::{Method, StatusCode};
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{sync::Mutex, time::Duration};
+use store::OperationPermit;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use url::{Host, Url};
@@ -32,6 +37,20 @@ use zeroize::Zeroizing;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BODY: usize = 65_536;
 
+/// Transport credential ownership is explicit. Browser code cannot substitute
+/// a made-up bearer value for the HttpOnly cookie owned by the browser.
+enum SessionCredential {
+    #[cfg(not(target_arch = "wasm32"))]
+    Bearer(Zeroizing<String>),
+    #[cfg(target_arch = "wasm32")]
+    BrowserCookie,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type IssuedSession = wire::SessionIssued;
+#[cfg(target_arch = "wasm32")]
+type IssuedSession = wire::BrowserSessionIssued;
+
 pub mod view;
 pub use view::{ClientError, View};
 
@@ -39,7 +58,7 @@ struct WireRequest<'a> {
     method: Method,
     path: &'a str,
     body: Option<Vec<u8>>,
-    token: Option<&'a str>,
+    token: Option<&'a SessionCredential>,
     locale: &'a str,
     signature: Option<nddev_device_sync_http_signatures::Headers>,
 }
@@ -70,8 +89,9 @@ struct State {
 /// One bounded operation per client; concurrent calls fail instead of queuing.
 pub struct IdentityClient {
     endpoint: Url,
+    #[cfg(not(target_arch = "wasm32"))]
     http: reqwest::Client,
-    store: NativeSessionStore,
+    store: SessionStore,
     state: Mutex<State>,
     cancellation: Mutex<CancellationToken>,
 }
@@ -82,19 +102,25 @@ impl IdentityClient {
     }
     pub fn new(endpoint: &str) -> Result<Self, ClientError> {
         let endpoint = validate_endpoint(endpoint)?;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(1);
-        if endpoint.scheme() == "http" {
-            builder = builder.no_proxy();
-        }
-        let http = builder.build().map_err(|_| ClientError::Transport)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let http = {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(1);
+            if endpoint.scheme() == "http" {
+                builder = builder.no_proxy();
+            }
+            builder.build().map_err(|_| ClientError::Transport)?
+        };
+        #[cfg(target_arch = "wasm32")]
+        transport::browser::validate_origin(&endpoint)?;
         Ok(Self {
-            store: NativeSessionStore::for_endpoint(endpoint.as_str())?,
+            store: SessionStore::for_endpoint(endpoint.as_str())?,
             endpoint,
+            #[cfg(not(target_arch = "wasm32"))]
             http,
             state: Mutex::new(State::default()),
             cancellation: Mutex::new(CancellationToken::new()),
@@ -133,10 +159,15 @@ impl IdentityClient {
         view
     }
 
-    fn operation(&self) -> Result<(OwnedSemaphorePermit, CancellationToken), ClientError> {
+    async fn operation(&self) -> Result<(OperationPermit, CancellationToken), ClientError> {
         let permit = self.store.operation()?;
         let token = CancellationToken::new();
         *self.cancellation.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(ClientError::Cancelled),
+            result = self.store.activate_operation(permit) => result?,
+        };
         Ok((permit, token))
     }
 
@@ -151,8 +182,8 @@ impl IdentityClient {
             let started = Instant::now();
             let result = operation.await;
             match &result {
-                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
-                    event.name=event,duration_ms=started.elapsed().as_millis() as u64,outcome="ok"
+                Ok(view) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
+                    event.name=event,duration_ms=started.elapsed().as_millis() as u64,outcome=if view.logout_pending {"pending"} else {"ok"}
                 }),
                 Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
                     event.name=event,duration_ms=started.elapsed().as_millis() as u64,error.type=error.code(),outcome="error"
@@ -168,14 +199,25 @@ impl IdentityClient {
     }
 
     async fn refresh_operation(&self) -> Result<View, ClientError> {
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
+        let result = self.refresh_online(&cancel).await;
+        if matches!(&result, Err(ClientError::Transport | ClientError::Timeout))
+            && let Some(view) = self.restore_offline(&cancel).await?
+        {
+            return Ok(view);
+        }
+        result
+    }
+
+    async fn refresh_online(&self, cancel: &CancellationToken) -> Result<View, ClientError> {
+        let signed_out = self.finish_pending_logout(cancel).await?;
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .view
             .session_verified = false;
-        let health: health_wire::HealthResponse = self.get("/v1/health", None, &cancel).await?;
-        let methods: wire::AuthMethods = self.get("/v2/auth/methods", None, &cancel).await?;
+        let health: health_wire::HealthResponse = self.get("/v1/health", None, cancel).await?;
+        let methods: wire::AuthMethods = self.get("/v2/auth/methods", None, cancel).await?;
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.view.server_version = health.version;
@@ -185,28 +227,26 @@ impl IdentityClient {
             s.view.passkey_available =
                 matches!(methods.passkey, wire::MethodAvailability::Available);
         }
-        let credential = self.store.read().await;
+        if signed_out {
+            return Ok(self.view());
+        }
+        let credential = self.stored_session_credential().await;
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .view
             .credential_store_ready = credential.is_ok();
-        if let Some(secret) = credential? {
-            let token = Zeroizing::new(
-                String::from_utf8(secret.to_vec()).map_err(|_| ClientError::CredentialStore)?,
-            );
-            if !valid_token(&token) {
-                return Err(ClientError::CredentialStore);
-            }
+        if let Some(token) = credential? {
             match self
-                .get::<wire::Session>("/v2/session", Some(&token), &cancel)
+                .get::<wire::Session>("/v2/session", Some(&token), cancel)
                 .await
             {
                 Ok(session) => {
                     let deadline = validate_session(&session)?;
-                    self.finish_persisted_session(session, deadline, &cancel)?;
+                    self.finish_persisted_session(session, deadline, cancel)?;
                 }
                 Err(ClientError::Server(code)) if code == "authentication_failed" => {
+                    #[cfg(not(target_arch = "wasm32"))]
                     self.store.delete().await?;
                     self.clear_session();
                 }
@@ -235,7 +275,8 @@ impl IdentityClient {
             return Err(ClientError::InvalidInput);
         }
         self.require_store_ready()?;
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
+        self.finish_pending_logout(&cancel).await?;
         {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(s.flow, Some(Flow::Email {resend, ..}) if resend > Instant::now()) {
@@ -278,7 +319,7 @@ impl IdentityClient {
         if code.len() != 8 || !code.bytes().all(|c| c.is_ascii_digit()) {
             return Err(ClientError::InvalidInput);
         }
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
         let id = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &s.flow {
@@ -309,7 +350,8 @@ impl IdentityClient {
 
     async fn start_github_operation(&self, locale: &str) -> Result<View, ClientError> {
         self.require_store_ready()?;
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
+        self.finish_pending_logout(&cancel).await?;
         let response: wire::GithubStart = self
             .post(
                 "/v2/auth/github/start",
@@ -350,8 +392,8 @@ impl IdentityClient {
 
     /// Native/browser WebAuthn flow; exchange tokens never leave this module.
     pub async fn passkeys(&self) -> Result<Vec<view::PasskeyView>, ClientError> {
-        let (_permit, cancel) = self.operation()?;
-        let token = self.session_token().await?;
+        let (_permit, cancel) = self.operation().await?;
+        let token = self.session_credential().await?;
         let page: wire::PasskeyList = self.get("/v2/auth/passkeys", Some(&token), &cancel).await?;
         if page.passkeys.len() > 16 {
             return Err(ClientError::InvalidResponse);
@@ -375,8 +417,8 @@ impl IdentityClient {
             if !passkey_id(&id) {
                 return Err(ClientError::InvalidInput);
             }
-            let (_permit, cancel) = self.operation()?;
-            let token = self.session_token().await?;
+            let (_permit, cancel) = self.operation().await?;
+            let token = self.session_credential().await?;
             let (status, body) = self
                 .request::<()>(
                     Method::DELETE,
@@ -413,16 +455,14 @@ impl IdentityClient {
     ) -> Result<View, ClientError> {
         self.observe("identity.passkey.start", async {
             self.require_store_ready()?;
-            let (_permit, cancel) = self.operation()?;
+            let (_permit, cancel) = self.operation().await?;
+            self.finish_pending_logout(&cancel).await?;
             let retained = if registration {
-                Some(self.store.read().await?.ok_or(ClientError::Expired)?)
+                Some(self.session_credential().await?)
             } else {
                 None
             };
-            let token = retained
-                .as_ref()
-                .map(|bytes| std::str::from_utf8(bytes).map_err(|_| ClientError::CredentialStore))
-                .transpose()?;
+            let token = retained.as_ref();
             let (status, body) = self
                 .request(
                     Method::POST,
@@ -484,7 +524,7 @@ impl IdentityClient {
     }
 
     async fn poll_github_operation(&self) -> Result<View, ClientError> {
-        let (_permit, cancel) = self.operation()?;
+        let (_permit, cancel) = self.operation().await?;
         let (request, passkey, registration) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &mut s.flow {
@@ -614,49 +654,50 @@ impl IdentityClient {
     }
 
     async fn logout_operation(&self) -> Result<View, ClientError> {
-        let (_permit, cancel) = self.operation()?;
-        let secret = self.store.read().await?;
-        if let Some(secret) = secret {
-            let token = Zeroizing::new(
-                String::from_utf8(secret.to_vec()).map_err(|_| ClientError::CredentialStore)?,
-            );
-            let result = self
-                .request::<()>(
-                    Method::DELETE,
-                    "/v2/session",
-                    None,
-                    Some(&token),
-                    "en",
-                    &cancel,
-                )
-                .await;
-            match result {
-                Ok((StatusCode::NO_CONTENT, _)) => {}
-                Err(ClientError::Server(code)) if code == "authentication_failed" => {}
-                Err(error) => return Err(error),
-                _ => return Err(ClientError::InvalidResponse),
-            }
-        }
-        self.store.delete().await?;
+        let (_permit, cancel) = self.operation().await?;
+        self.invalidate_offline(store::FenceMode::PendingLogout)
+            .await?;
         self.clear_session();
         self.clear_flow();
-        Ok(self.view())
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view
+            .logout_pending = true;
+        match self.finish_pending_logout(&cancel).await {
+            Ok(_) => Ok(self.view()),
+            Err(ClientError::Transport | ClientError::Timeout) => Ok(self.view()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn accept_session(
         &self,
-        response: wire::SessionIssued,
+        response: IssuedSession,
         cancel: &CancellationToken,
     ) -> Result<(), ClientError> {
         let deadline = validate_session(&response.session)?;
+        self.invalidate_offline(store::FenceMode::Checking).await?;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view
+            .logout_pending = false;
+        #[cfg(not(target_arch = "wasm32"))]
         if !valid_token(&response.session_token) {
             return Err(ClientError::InvalidResponse);
         }
         if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
-        let token = Zeroizing::new(response.session_token);
-        if let Err(error) = self.store.write(token.as_bytes()).await {
+        #[cfg(not(target_arch = "wasm32"))]
+        let persistence = self
+            .store
+            .write(Zeroizing::new(response.session_token).as_bytes())
+            .await;
+        #[cfg(target_arch = "wasm32")]
+        let persistence = self.store.offline_store(0).read().await.map(|_| ());
+        if let Err(error) = persistence {
             self.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -694,6 +735,11 @@ impl IdentityClient {
         s.session_deadline = Some(deadline);
         s.view.authenticated = true;
         s.view.session_verified = true;
+        s.view.offline_authorized = false;
+        s.view.offline_cache_ready = false;
+        s.view.current_device_id.clear();
+        s.view.devices.clear();
+        s.view.devices_checked_at = 0;
         s.view.credential_revalidation_required = false;
         s.view.session_checked_at = OffsetDateTime::now_utc().unix_timestamp();
         s.view.user_id = session.user_id;
@@ -712,6 +758,8 @@ impl IdentityClient {
         s.session_deadline = None;
         s.view.authenticated = false;
         s.view.session_verified = false;
+        s.view.offline_authorized = false;
+        s.view.offline_cache_ready = false;
         s.view.credential_revalidation_required = false;
         s.view.session_checked_at = 0;
         s.view.user_id.clear();
@@ -728,6 +776,8 @@ impl IdentityClient {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.view.session_verified = false;
         state.view.credential_revalidation_required = true;
+        state.view.offline_authorized = false;
+        state.view.offline_cache_ready = false;
     }
 
     fn require_store_ready(&self) -> Result<(), ClientError> {
@@ -750,7 +800,7 @@ impl IdentityClient {
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
-        token: Option<&str>,
+        token: Option<&SessionCredential>,
         cancel: &CancellationToken,
     ) -> Result<T, ClientError> {
         let (status, body) = self
@@ -784,7 +834,7 @@ impl IdentityClient {
         method: Method,
         path: &str,
         body: Option<&T>,
-        token: Option<&str>,
+        token: Option<&SessionCredential>,
         locale: &str,
         cancel: &CancellationToken,
     ) -> Result<(StatusCode, Vec<u8>), ClientError> {
@@ -846,49 +896,10 @@ impl IdentityClient {
             { event.name = "identity.request_started", route });
         let mut propagation = std::collections::HashMap::new();
         TraceContextPropagator::new().inject_context(&context, &mut propagation);
-        let mut request = self
-            .http
-            .request(
-                method,
-                self.endpoint
-                    .join(path)
-                    .map_err(|_| ClientError::InvalidEndpoint)?,
-            )
-            .header("accept-language", if locale == "ru" { "ru" } else { "en" });
-        for (key, value) in propagation {
-            request = request.header(key, value);
-        }
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            request = request.header("content-type", match path { "/v2/observability/events" => "application/x-ndjson", "/v2/observability/traces" => "application/x-protobuf", _ => "application/json" }).body(body);
-        }
-        if let Some(signature) = signature {
-            request = request.header("signature",signature.signature).header("signature-input",signature.signature_input).header("content-digest",signature.content_digest);
-        }
         let operation = async {
-            let mut response = request.send().await.map_err(|e| {
-                if e.is_timeout() {
-                    ClientError::Timeout
-                } else {
-                    ClientError::Transport
-                }
-            })?;
-            let status = response.status();
-            if response
-                .content_length()
-                .is_some_and(|n| n > MAX_BODY as u64)
-            {
-                return Err(ClientError::InvalidResponse);
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| ClientError::Transport)? {
-                if bytes.len() + chunk.len() > MAX_BODY {
-                    return Err(ClientError::InvalidResponse);
-                }
-                bytes.extend_from_slice(&chunk);
-            }
+            let (status, bytes) = self.transport_request(WireRequest {
+                method, path, body, token, locale, signature,
+            }, propagation).await?;
             if !status.is_success() {
                 // A retained revision conflict is a sync result, not a generic
                 // error. Preserve its exact bytes for the durable client inbox.
@@ -900,11 +911,13 @@ impl IdentityClient {
                     .map_err(|_| ClientError::InvalidResponse)?;
                 if token.is_some() && code.as_str() == Some("authentication_failed") {
                     self.require_revalidation();
+                    self.invalidate_offline(store::FenceMode::Denied).await?;
                 }
                 if token.is_some() && code.as_str() == Some("device_revoked") {
                     for device in &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).view.devices {
                         if device.is_current { device.revoked = true; }
                     }
+                    self.invalidate_offline(store::FenceMode::Denied).await?;
                     return Err(ClientError::DeviceRevoked);
                 }
                 return Err(ClientError::Server(
@@ -918,7 +931,7 @@ impl IdentityClient {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ClientError::Cancelled),
-            result = tokio::time::timeout(REQUEST_TIMEOUT, operation) => result.unwrap_or(Err(ClientError::Timeout)),
+            result = runtime::timeout(REQUEST_TIMEOUT, operation) => result.unwrap_or(Err(ClientError::Timeout)),
         };
         match &result {
             Ok((status, _)) => tracing::event!(target: "nds_accounts", tracing::Level::INFO,
@@ -1014,6 +1027,8 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
     {
         state.view.authenticated = false;
         state.view.session_verified = false;
+        state.view.offline_authorized = false;
+        state.view.offline_cache_ready = false;
         state.session_deadline = None;
     }
 }
@@ -1113,7 +1128,7 @@ mod native_completion_tests {
     async fn cancellation_after_native_persistence_requires_revalidation() {
         let endpoint = format!("https://nds-completion-{}.invalid", uuid::Uuid::new_v4());
         let client = IdentityClient::new(&endpoint).unwrap();
-        let (_permit, cancel) = client.operation().unwrap();
+        let (_permit, cancel) = client.operation().await.unwrap();
         assert!(client.store.read().await.unwrap().is_none());
         let secret = uuid::Uuid::new_v4().simple().to_string().repeat(2);
         client.store.write(secret.as_bytes()).await.unwrap();
@@ -1143,7 +1158,8 @@ mod native_completion_tests {
     #[test]
     fn cancelled_response_cannot_recreate_a_sign_in_flow() {
         let client = IdentityClient::new("https://cancelled.example").unwrap();
-        let (_permit, cancel) = client.operation().unwrap();
+        let cancel = CancellationToken::new();
+        *client.cancellation.lock().unwrap() = cancel.clone();
         client.cancel_sign_in();
         let result = client.finish_flow(
             Flow::Email {
@@ -1162,7 +1178,8 @@ mod native_completion_tests {
     #[test]
     fn expired_flow_is_removed_from_owned_state_and_view() {
         let client = IdentityClient::new("https://expired.example").unwrap();
-        let (_permit, cancel) = client.operation().unwrap();
+        let cancel = CancellationToken::new();
+        *client.cancellation.lock().unwrap() = cancel.clone();
         client
             .finish_flow(
                 Flow::Browser {

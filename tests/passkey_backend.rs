@@ -1,5 +1,5 @@
 //! Browser-driven acceptance against an owned PostgreSQL/Mailpit fixture.
-use nddev_device_sync_accounts::{IdentityClient, NativeSessionStore};
+use nddev_device_sync_accounts::{IdentityClient, SessionStore};
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 
@@ -80,7 +80,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     .unwrap();
     let initial = client.verify_email(otp).await.unwrap();
     let owner = (initial.user_id, initial.tenant_id);
-    let native = NativeSessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
+    let native = SessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
     let otp_session = native.read().await.unwrap().unwrap();
     let mut first_key = String::new();
     let mut first_session = None;
@@ -128,7 +128,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     let view = restored.refresh().await.unwrap();
     assert!(view.authenticated && view.session_verified);
     assert_eq!(view.auth_method, "passkey");
-    let native = NativeSessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
+    let native = SessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
     let token = native.read().await.unwrap().unwrap();
     let keys = restored.passkeys().await.unwrap();
     assert_eq!(keys.len(), 2);
