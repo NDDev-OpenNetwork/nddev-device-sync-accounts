@@ -43,6 +43,7 @@ pub struct View {
     pub devices_checked_at: i64,
     pub email_available: bool,
     pub github_available: bool,
+    pub passkey_available: bool,
     pub credential_store_ready: bool,
     pub server_version: String,
     pub authenticated: bool,
