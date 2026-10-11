@@ -128,6 +128,8 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     let view = restored.refresh().await.unwrap();
     assert!(view.authenticated && view.session_verified);
     assert_eq!(view.auth_method, "passkey");
+    restored.refresh_devices().await.unwrap();
+    restored.authorize_local().await.unwrap();
     let native = SessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
     let token = native.read().await.unwrap().unwrap();
     let keys = restored.passkeys().await.unwrap();
@@ -148,6 +150,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
             && still_active.session_verified
             && still_active.passkey_available
     );
+    restored.authorize_local().await.unwrap();
     assert_eq!(
         http.get(format!("{endpoint}/v2/session"))
             .bearer_auth(std::str::from_utf8(&first_session).unwrap())
@@ -173,6 +176,7 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         .await
         .unwrap();
     assert!(!revoked.authenticated && !revoked.session_verified && !revoked.passkey_available);
+    assert!(client.authorize_local().await.is_err());
     // Committed revocation invalidates the server session atomically. Ordinary
     // refresh then removes its stale cached bearer without touching device keys.
     let refreshed = restored.refresh().await.unwrap();

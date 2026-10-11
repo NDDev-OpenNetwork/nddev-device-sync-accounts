@@ -129,10 +129,15 @@ impl IdentityClient {
             let public = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
             let devices = self.device_inventory(&token, &cancel).await?;
             if let Some(existing) = devices.iter().find(|device| device.public_key == public) {
-                if matches!(existing.status, dto::Status::Revoked) {
+                let revoked = matches!(existing.status, dto::Status::Revoked);
+                self.finish_devices(devices, Some(&public), &cancel)?;
+                if revoked {
+                    self.invalidate_offline(crate::store::FenceMode::Denied)
+                        .await?;
                     return Err(ClientError::DeviceRevoked);
                 }
-                return self.finish_devices(devices, Some(&public), &cancel);
+                self.persist_offline_authorization().await;
+                return Ok(self.view());
             }
             let platform = platform();
             let (status, bytes) = self
@@ -199,6 +204,10 @@ impl IdentityClient {
                 .view
                 .devices_checked_at = 0;
             let token = self.session_credential().await?;
+            if self.view().current_device_id == id {
+                self.invalidate_offline(crate::store::FenceMode::Denied)
+                    .await?;
+            }
             let (status, _) = self
                 .request::<()>(
                     Method::DELETE,
@@ -284,6 +293,18 @@ impl IdentityClient {
         cancel: &CancellationToken,
     ) -> Result<View, ClientError> {
         let devices = self.device_inventory(token, cancel).await?;
+        let has_current = devices.iter().any(|device| {
+            public == Some(device.public_key.as_str())
+                && matches!(device.status, dto::Status::Active)
+        });
+        if !has_current
+            && let Err(error) = self
+                .invalidate_offline(crate::store::FenceMode::Denied)
+                .await
+        {
+            self.require_revalidation();
+            return Err(error);
+        }
         self.finish_devices(devices, public, cancel)?;
         self.persist_offline_authorization().await;
         Ok(self.view())
@@ -521,6 +542,13 @@ mod tests {
             );
             let revoked = again.revoke_device(first.current_device_id.clone()).await?;
             assert!(revoked.devices[0].revoked && revoked.devices[0].is_current);
+            assert!(client.authorize_local().await.is_err());
+            let cold = IdentityClient::new(endpoint)?;
+            assert!(
+                cold.restore_offline(&CancellationToken::new())
+                    .await?
+                    .is_none()
+            );
             assert!(matches!(
                 again.enroll_device("Another name".into()).await,
                 Err(ClientError::DeviceRevoked)
