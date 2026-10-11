@@ -1,4 +1,4 @@
-use nddev_device_sync_accounts::{IdentityClient, NativeSessionStore};
+use nddev_device_sync_accounts::{IdentityClient, SessionStore};
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 
@@ -72,7 +72,7 @@ async fn actual_mailbox_session_persistence_and_revocation() {
     assert!(restored.authenticated);
     assert!(restored.user_id == view.user_id && restored.tenant_id == view.tenant_id);
     let store =
-        NativeSessionStore::for_endpoint(&format!("{}/", endpoint.trim_end_matches('/'))).unwrap();
+        SessionStore::for_endpoint(&format!("{}/", endpoint.trim_end_matches('/'))).unwrap();
     let old = store.read().await.unwrap().unwrap();
     assert!(!another.logout().await.unwrap().authenticated);
     assert!(store.read().await.unwrap().is_none());

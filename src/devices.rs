@@ -4,47 +4,66 @@
 use crate::{ClientError, IdentityClient, View, device_wire as dto, view::DeviceView};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
+use http::{Method, StatusCode};
 use nddev_device_sync_domain::devices::{DeviceName, ENROLLMENT_DOMAIN, MAX_DEVICE_IDENTITIES};
-use reqwest::{Method, StatusCode};
 use ring::rand::{SecureRandom, SystemRandom};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 impl IdentityClient {
-    pub(crate) fn device_store(&self) -> Result<crate::NativeSessionStore, ClientError> {
+    pub(crate) fn device_store(&self) -> Result<crate::SessionStore, ClientError> {
         let view = self.view();
-        if !view.authenticated || !view.session_verified || view.credential_revalidation_required {
+        if !view.authenticated
+            || !(view.session_verified || view.offline_authorized)
+            || view.credential_revalidation_required
+        {
             return Err(ClientError::RevalidationRequired);
         }
         Ok(self.store.device_store(&view.tenant_id, &view.user_id))
     }
 
-    pub(crate) async fn session_token(&self) -> Result<Zeroizing<String>, ClientError> {
-        let secret = self
-            .store
-            .read()
+    pub(crate) async fn session_credential(&self) -> Result<crate::SessionCredential, ClientError> {
+        self.stored_session_credential()
             .await?
-            .ok_or(ClientError::RevalidationRequired)?;
-        let token = Zeroizing::new(
-            String::from_utf8(secret.to_vec()).map_err(|_| ClientError::CredentialStore)?,
-        );
-        if !crate::valid_token(&token) {
-            return Err(ClientError::CredentialStore);
+            .ok_or(ClientError::RevalidationRequired)
+    }
+
+    pub(crate) async fn stored_session_credential(
+        &self,
+    ) -> Result<Option<crate::SessionCredential>, ClientError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(secret) = self.store.read().await? else {
+                return Ok(None);
+            };
+            let token = Zeroizing::new(
+                String::from_utf8(secret.to_vec()).map_err(|_| ClientError::CredentialStore)?,
+            );
+            if !crate::valid_token(&token) {
+                return Err(ClientError::CredentialStore);
+            }
+            Ok(Some(crate::SessionCredential::Bearer(token)))
         }
-        Ok(token)
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Prove the browser credential backend is accessible without ever
+            // trying to read or persist the HttpOnly session credential.
+            self.store.offline_store(0).read().await?;
+            Ok(Some(crate::SessionCredential::BrowserCookie))
+        }
     }
 
     pub async fn refresh_devices(&self) -> Result<View, ClientError> {
         self.observe("device.inventory.refresh", async {
-            let (_permit, cancel) = self.operation()?;
+            let (_permit, cancel) = self.operation().await?;
             let store = self.device_store()?;
             self.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .view
                 .devices_checked_at = 0;
-            let token = self.session_token().await?;
+            let token = self.session_credential().await?;
             let key = read_key(&store).await?;
             let public = key
                 .as_ref()
@@ -77,14 +96,14 @@ impl IdentityClient {
     pub async fn enroll_device(&self, name: String) -> Result<View, ClientError> {
         DeviceName::new(name.clone()).map_err(|_| ClientError::InvalidInput)?;
         self.observe("device.enrollment", async {
-            let (_permit, cancel) = self.operation()?;
+            let (_permit, cancel) = self.operation().await?;
             let store = self.device_store()?;
             self.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .view
                 .devices_checked_at = 0;
-            let token = self.session_token().await?;
+            let token = self.session_credential().await?;
             let key = match read_key(&store).await? {
                 Some(key) => key,
                 None => {
@@ -172,14 +191,14 @@ impl IdentityClient {
             return Err(ClientError::InvalidInput);
         }
         self.observe("device.revocation", async {
-            let (_permit, cancel) = self.operation()?;
+            let (_permit, cancel) = self.operation().await?;
             self.device_store()?;
             self.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .view
                 .devices_checked_at = 0;
-            let token = self.session_token().await?;
+            let token = self.session_credential().await?;
             let (status, _) = self
                 .request::<()>(
                     Method::DELETE,
@@ -213,7 +232,7 @@ impl IdentityClient {
 
     async fn device_inventory(
         &self,
-        token: &str,
+        token: &crate::SessionCredential,
         cancel: &CancellationToken,
     ) -> Result<Vec<dto::Device>, ClientError> {
         let mut devices = Vec::new();
@@ -260,12 +279,14 @@ impl IdentityClient {
 
     async fn update_devices(
         &self,
-        token: &str,
+        token: &crate::SessionCredential,
         public: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<View, ClientError> {
         let devices = self.device_inventory(token, cancel).await?;
-        self.finish_devices(devices, public, cancel)
+        self.finish_devices(devices, public, cancel)?;
+        self.persist_offline_authorization().await;
+        Ok(self.view())
     }
 
     fn finish_devices(
@@ -303,7 +324,7 @@ impl IdentityClient {
 }
 
 pub(crate) async fn read_key(
-    store: &crate::NativeSessionStore,
+    store: &crate::SessionStore,
 ) -> Result<Option<SigningKey>, ClientError> {
     store
         .read()
@@ -362,9 +383,14 @@ fn platform_name(value: &dto::Platform) -> &'static str {
         dto::Platform::Linux => "linux",
         dto::Platform::Macos => "macos",
         dto::Platform::Windows => "windows",
+        dto::Platform::Web => "web",
     }
 }
 fn platform() -> dto::Platform {
+    #[cfg(target_arch = "wasm32")]
+    {
+        dto::Platform::Web
+    }
     #[cfg(target_os = "android")]
     {
         dto::Platform::Android

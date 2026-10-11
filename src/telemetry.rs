@@ -1,12 +1,13 @@
 //! Authenticated native delivery shared by Flutter and the agent CLI. The SDK
 //! owns record/batch lifetime; this adapter owns policy, bounded retries and I/O.
+use crate::runtime::{self, Instant, Task};
 use crate::{ClientError, IdentityClient, SyncRequest, observability_wire as wire};
 use nddev_device_sync_telemetry::{ExportBatch, ExportFeed, FeedHealth};
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::view::{DeliveryView, ExportPolicy};
@@ -16,7 +17,7 @@ pub struct Delivery {
     state: Arc<Mutex<DeliveryView>>,
     active: watch::Sender<bool>,
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: Task,
 }
 impl Delivery {
     pub fn start(
@@ -34,7 +35,7 @@ impl Delivery {
         }));
         let (active, receiver) = watch::channel(foreground);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(
+        let task = runtime::spawn(run(
             identity,
             events.clone(),
             traces.clone(),
@@ -97,7 +98,7 @@ impl Delivery {
             {
                 return view;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            runtime::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -157,7 +158,7 @@ async fn run(
         events.health();
         traces.health();
         if !*active.borrow() {
-            tokio::select! { _ = cancel.cancelled() => break, changed = active.changed() => { if changed.is_err() { break; } }, _ = tokio::time::sleep(Duration::from_secs(30)) => {} }
+            tokio::select! { _ = cancel.cancelled() => break, changed = active.changed() => { if changed.is_err() { break; } }, _ = runtime::sleep(Duration::from_secs(30)) => {} }
             checked = None;
             delay = Duration::ZERO;
             continue;
@@ -165,7 +166,7 @@ async fn run(
         tokio::select! {
             _ = cancel.cancelled() => break,
             changed = active.changed() => { if changed.is_err() { break; } checked = None; delay = Duration::ZERO; continue; },
-            _ = tokio::time::sleep(delay) => {}
+            _ = runtime::sleep(delay) => {}
         }
         if checked.is_none_or(|time| time.elapsed() >= Duration::from_secs(30)) {
             let result = tokio::select! {
@@ -271,9 +272,10 @@ async fn run(
                 state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .last_success_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs());
+                    .last_success_at = time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .try_into()
+                    .unwrap_or_default();
                 delay = Duration::from_millis(200);
             }
             Err(error) if terminal(&error) => break,
