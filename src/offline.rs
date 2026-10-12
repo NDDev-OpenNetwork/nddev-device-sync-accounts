@@ -302,11 +302,21 @@ impl IdentityClient {
         cancel: &CancellationToken,
     ) -> Result<bool, ClientError> {
         let fence = self.store.authorization_fence(None).await?;
-        if !fence.is_some_and(|f| matches!(f.mode, FenceMode::PendingLogout | FenceMode::SignedOut))
+        if !fence
+            .as_ref()
+            .is_some_and(|f| matches!(f.mode, FenceMode::PendingLogout | FenceMode::SignedOut))
         {
             return Ok(false);
         }
         self.clear_session();
+        if fence.is_some_and(|f| f.mode == FenceMode::SignedOut) {
+            // The remote logout is already acknowledged. Preserve an explicit
+            // new sign-in flow and never emit another DELETE/generation change.
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.view.logout_pending = false;
+            state.view.credential_store_ready = true;
+            return Ok(true);
+        }
         self.clear_flow();
         #[cfg(target_arch = "wasm32")]
         self.store.clear_browser_access().await?;
@@ -373,7 +383,9 @@ mod acceptance {
         let mailbox = data["mailpit_url"].as_str().unwrap();
         let owner = data["owner_email"].as_str().unwrap();
         assert!(
-            endpoint.starts_with("http://127.0.0.1:") && mailbox.starts_with("http://127.0.0.1:")
+            (endpoint.starts_with("http://127.0.0.1:")
+                || endpoint.starts_with("http://localhost:"))
+                && mailbox.starts_with("http://127.0.0.1:")
         );
         assert!(owner.ends_with(".invalid"));
         let control = receipt.with_extension("control.json");
@@ -440,6 +452,10 @@ mod acceptance {
                     && enrolled.session_verified
                     && !enrolled.offline_authorized
             );
+            let refreshed = client.refresh().await.unwrap();
+            assert_eq!(refreshed.current_device_id, enrolled.current_device_id);
+            assert_eq!(refreshed.devices_checked_at, enrolled.devices_checked_at);
+            client.authorize_local().await.unwrap();
             let key = client
                 .device_store()
                 .unwrap()
@@ -476,6 +492,12 @@ mod acceptance {
             let after = closed.refresh().await.unwrap();
             assert!(!after.authenticated && !after.logout_pending && after.credential_store_ready);
             assert!(closed.store.read().await.unwrap().is_none());
+            let acknowledged = closed.store.authorization_fence(None).await.unwrap();
+            closed.refresh().await.unwrap();
+            assert!(
+                closed.store.authorization_fence(None).await.unwrap() == acknowledged,
+                "an acknowledged logout must not create another durable decision"
+            );
             let device_store = client
                 .store
                 .device_store(&enrolled.tenant_id, &enrolled.user_id);

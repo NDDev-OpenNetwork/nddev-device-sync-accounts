@@ -206,6 +206,9 @@ impl IdentityClient {
         {
             return Ok(view);
         }
+        if matches!(&result, Err(ClientError::InvalidResponse)) {
+            self.require_revalidation();
+        }
         result
     }
 
@@ -217,6 +220,16 @@ impl IdentityClient {
             .view
             .session_verified = false;
         let health: health_wire::HealthResponse = self.get("/v1/health", None, cancel).await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Negotiate the cookie boundary before exposing sign-in actions.
+            // An older bearer-only server must not issue its token to a browser.
+            let capabilities: wire::BrowserCapabilities =
+                self.get("/v2/browser", None, cancel).await?;
+            if capabilities.replica_protocol != 2 {
+                return Err(ClientError::InvalidResponse);
+            }
+        }
         let methods: wire::AuthMethods = self.get("/v2/auth/methods", None, cancel).await?;
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,7 +256,7 @@ impl IdentityClient {
             {
                 Ok(session) => {
                     let deadline = validate_session(&session)?;
-                    self.finish_persisted_session(session, deadline, cancel)?;
+                    self.finish_persisted_session(session, deadline, cancel, true)?;
                 }
                 Err(ClientError::Server(code)) if code == "authentication_failed" => {
                     #[cfg(not(target_arch = "wasm32"))]
@@ -740,7 +753,7 @@ impl IdentityClient {
             self.require_revalidation();
             return Err(error);
         }
-        self.finish_persisted_session(response.session, deadline, cancel)
+        self.finish_persisted_session(response.session, deadline, cancel, false)
     }
 
     fn finish_persisted_session(
@@ -748,6 +761,7 @@ impl IdentityClient {
         session: wire::Session,
         deadline: Instant,
         cancel: &CancellationToken,
+        preserve_devices: bool,
     ) -> Result<(), ClientError> {
         let completion = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
         if cancel.is_cancelled() || deadline <= Instant::now() {
@@ -758,22 +772,30 @@ impl IdentityClient {
             self.require_revalidation();
             return Err(ClientError::RevalidationRequired);
         }
-        self.set_session(session, deadline);
+        self.set_session(session, deadline, preserve_devices);
         self.clear_flow();
         drop(completion);
         Ok(())
     }
 
-    fn set_session(&self, session: wire::Session, deadline: Instant) {
+    fn set_session(&self, session: wire::Session, deadline: Instant, preserve_devices: bool) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let preserve_devices = preserve_devices
+            && s.view.user_id == session.user_id
+            && s.view.tenant_id == session.tenant_id;
         s.session_deadline = Some(deadline);
         s.view.authenticated = true;
         s.view.session_verified = true;
         s.view.offline_authorized = false;
-        s.view.offline_cache_ready = false;
-        s.view.current_device_id.clear();
-        s.view.devices.clear();
-        s.view.devices_checked_at = 0;
+        // A successful refresh of the same owner is not a new sign-in. Keep
+        // the last device observation until the inventory refresh replaces it.
+        // Local operations still consult the protected grant on every use.
+        if !preserve_devices {
+            s.view.offline_cache_ready = false;
+            s.view.current_device_id.clear();
+            s.view.devices.clear();
+            s.view.devices_checked_at = 0;
+        }
         s.view.credential_revalidation_required = false;
         s.view.session_checked_at = OffsetDateTime::now_utc().unix_timestamp();
         s.view.user_id = session.user_id;
@@ -1178,6 +1200,7 @@ mod native_completion_tests {
             },
             Instant::now() + Duration::from_secs(3600),
             &cancel,
+            false,
         );
         let view = client.view();
         let persisted = client.store.read().await;

@@ -70,3 +70,11 @@ ordinary refresh removes a revoked cached bearer; vault and device keys persist.
 The browser acceptance exercises two actual virtual authenticators, selective
 credential/session revocation, idempotent absence, and preservation of OTP login.
 Physical authenticator qualification is separate.
+
+Browser telemetry uses the SDK's authenticated-scope IndexedDB spool. RAM ingress
+staging runs independently of the common native/browser HTTP sender; a stalled
+request cannot block new durable batches. Retry counters survive page restart,
+and sender locks are released during backoff or backgrounding. The delivery view
+reports the browser's last payload-write readiness separately from transport
+policy and acknowledgements. A readable store does not prove quota recovery.
+Scope changes stop the sender before old queued data can acquire another owner.
