@@ -107,6 +107,8 @@ pub enum ExportPolicy {
 #[derive(Clone, Default)]
 pub struct DeliveryView {
     pub initialized: bool,
+    /// Browser durable-spool availability; native transport does not use it.
+    pub local_persistence_ready: Option<bool>,
     pub policy: ExportPolicy,
     pub paused: bool,
     pub pending: u32,
