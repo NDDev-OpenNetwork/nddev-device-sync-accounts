@@ -49,13 +49,13 @@ jobs:
           import os,re,tomllib
           from pathlib import Path
           lock=tomllib.loads(Path('protocol.lock').read_text())
-          assert lock['source_repo']=='NDDev-OpenNetwork/nddev-device-sync-protocol'
+          assert lock['source_repo']=='NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol'
           assert re.fullmatch('[a-f0-9]{40}',lock['source_commit'])
           with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('sha='+lock['source_commit']+'\n')
           PY
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: NDDev-OpenNetwork/nddev-device-sync-protocol
+          repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol
           ref: ${{ steps.protocol.outputs.sha }}
           path: vendor/protocol
           persist-credentials: false

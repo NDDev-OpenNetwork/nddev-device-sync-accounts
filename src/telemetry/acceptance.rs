@@ -19,7 +19,7 @@ async fn actual_signed_client_delivery_and_incidents() {
     let config = Config {
         service: "nddev-device-sync-client".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        repository: "NDDev-OpenNetwork/nddev-device-sync-desktop".into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop".into(),
         commit: "unknown".into(),
         channel: "alpha".into(),
         standards: "unreleased".into(),
@@ -274,6 +274,7 @@ async fn actual_signed_client_delivery_and_incidents() {
                         assert_eq!(row["service_device_id"], view.current_device_id);
                         assert_eq!(row["service_user_id"], view.user_id);
                         assert_eq!(row["service_tenant_id"], view.tenant_id);
+                        assert_eq!(row["service_source_repository"], "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop");
                         assert_eq!(row["operation_name"], "module.operation");
                         count += 1;
                     }
