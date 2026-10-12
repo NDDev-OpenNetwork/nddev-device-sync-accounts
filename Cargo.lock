@@ -1670,7 +1670,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-telemetry"
 version = "0.0.1-alpha.7"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=77e7e3ece9ac5aff400ce7a0880e52503b5ee41c#77e7e3ece9ac5aff400ce7a0880e52503b5ee41c"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=683e53492f89d0577e1372534b0ae7dce37aff9b#683e53492f89d0577e1372534b0ae7dce37aff9b"
 dependencies = [
  "android_log-sys",
  "chrono",
