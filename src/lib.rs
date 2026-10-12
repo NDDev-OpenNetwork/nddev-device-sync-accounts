@@ -220,6 +220,16 @@ impl IdentityClient {
             .view
             .session_verified = false;
         let health: health_wire::HealthResponse = self.get("/v1/health", None, cancel).await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Negotiate the cookie boundary before exposing sign-in actions.
+            // An older bearer-only server must not issue its token to a browser.
+            let capabilities: wire::BrowserCapabilities =
+                self.get("/v2/browser", None, cancel).await?;
+            if capabilities.replica_protocol != 2 {
+                return Err(ClientError::InvalidResponse);
+            }
+        }
         let methods: wire::AuthMethods = self.get("/v2/auth/methods", None, cancel).await?;
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
