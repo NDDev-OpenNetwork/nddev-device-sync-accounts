@@ -1,22 +1,24 @@
 //! Authenticated native delivery shared by Flutter and the agent CLI. The SDK
 //! owns record/batch lifetime; this adapter owns policy, bounded retries and I/O.
+use crate::runtime::{self, Instant, Task};
 use crate::{ClientError, IdentityClient, SyncRequest, observability_wire as wire};
-use nddev_device_sync_telemetry::{ExportBatch, ExportFeed, FeedHealth};
+use nddev_device_sync_telemetry::ExportFeed;
+mod source;
+use source::{Batch, Source};
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::view::{DeliveryView, ExportPolicy};
 pub struct Delivery {
-    events: Arc<ExportFeed>,
-    traces: Arc<ExportFeed>,
+    source: Arc<Source>,
     state: Arc<Mutex<DeliveryView>>,
     active: watch::Sender<bool>,
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: Task,
 }
 impl Delivery {
     pub fn start(
@@ -25,8 +27,7 @@ impl Delivery {
         traces: ExportFeed,
         foreground: bool,
     ) -> Self {
-        let events = Arc::new(events);
-        let traces = Arc::new(traces);
+        let source = Arc::new(Source::new(&identity, events, traces));
         let state = Arc::new(Mutex::new(DeliveryView {
             initialized: true,
             paused: !foreground,
@@ -34,17 +35,17 @@ impl Delivery {
         }));
         let (active, receiver) = watch::channel(foreground);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(
+        #[cfg(target_arch = "wasm32")]
+        source.start_staging(cancel.clone());
+        let task = runtime::spawn(run(
             identity,
-            events.clone(),
-            traces.clone(),
+            source.clone(),
             state.clone(),
             receiver,
             cancel.clone(),
         ));
         Self {
-            events,
-            traces,
+            source,
             state,
             active,
             cancel,
@@ -57,21 +58,7 @@ impl Delivery {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let FeedHealth {
-            pending,
-            delivered,
-            dropped,
-            failures,
-        } = self.events.health();
-        view.pending = pending;
-        view.delivered = delivered;
-        view.dropped = dropped;
-        view.failures = failures.saturating_add(view.failures);
-        let health = self.traces.health();
-        view.spans_pending = health.pending;
-        view.spans_delivered = health.delivered;
-        view.spans_dropped = health.dropped;
-        view.spans_failures = health.failures;
+        self.source.snapshot(&mut view);
         view
     }
     pub fn foreground(&self, active: bool) {
@@ -97,32 +84,35 @@ impl Delivery {
             {
                 return view;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            runtime::sleep(Duration::from_millis(50)).await;
         }
     }
 }
 impl Drop for Delivery {
     fn drop(&mut self) {
-        self.events.close();
-        self.traces.close();
+        self.source.close();
         self.cancel.cancel();
         self.task.abort();
     }
 }
 struct Worker {
-    events: Arc<ExportFeed>,
-    traces: Arc<ExportFeed>,
+    source: Arc<Source>,
     state: Arc<Mutex<DeliveryView>>,
+    cancel: CancellationToken,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.events.close();
-        self.traces.close();
+        self.source.close();
+        self.cancel.cancel();
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .initialized = false;
     }
+}
+fn record_failure(state: &Mutex<DeliveryView>) {
+    let mut view = state.lock().unwrap_or_else(|error| error.into_inner());
+    view.failures = view.failures.saturating_add(1);
 }
 fn terminal(error: &ClientError) -> bool {
     matches!(
@@ -132,52 +122,64 @@ fn terminal(error: &ClientError) -> bool {
 }
 async fn run(
     identity: Arc<IdentityClient>,
-    events: Arc<ExportFeed>,
-    traces: Arc<ExportFeed>,
+    source: Arc<Source>,
     state: Arc<Mutex<DeliveryView>>,
     mut active: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
     let _worker = Worker {
-        events: events.clone(),
-        traces: traces.clone(),
+        source: source.clone(),
         state: state.clone(),
+        cancel: cancel.clone(),
     };
-    let mut pending: Option<(ExportBatch, bool)> = None;
+    let mut pending: Option<Batch> = None;
     let mut attempts = 0u32;
     let mut delay = Duration::ZERO;
     let mut checked: Option<Instant> = None;
     let mut trace_turn = false;
     loop {
-        if pending.as_ref().is_some_and(|(batch, _)| batch.expired()) {
-            pending = None;
+        if !source.matches(&identity) {
+            break;
+        }
+        if pending.as_ref().is_some_and(Batch::expired)
+            && let Some(batch) = pending.take()
+        {
+            let _ = batch.discard(&source).await;
         }
         // Opportunistic expiry also runs while backgrounded; never send a
         // retained batch merely because policy discovery was unavailable.
-        events.health();
-        traces.health();
+        if source.maintain().await.is_err() {
+            Batch::park(&mut pending);
+            record_failure(&state);
+            tokio::select! { _ = cancel.cancelled() => break, _ = runtime::sleep(Duration::from_secs(5)) => {} }
+            continue;
+        }
         if !*active.borrow() {
-            tokio::select! { _ = cancel.cancelled() => break, changed = active.changed() => { if changed.is_err() { break; } }, _ = tokio::time::sleep(Duration::from_secs(30)) => {} }
+            Batch::park(&mut pending);
+            tokio::select! { _ = cancel.cancelled() => break, changed = active.changed() => { if changed.is_err() { break; } }, _ = runtime::sleep(Duration::from_secs(30)) => {} }
             checked = None;
             delay = Duration::ZERO;
             continue;
         }
         tokio::select! {
             _ = cancel.cancelled() => break,
-            changed = active.changed() => { if changed.is_err() { break; } checked = None; delay = Duration::ZERO; continue; },
-            _ = tokio::time::sleep(delay) => {}
+            changed = active.changed() => { if changed.is_err() { break; } Batch::park(&mut pending); checked = None; delay = Duration::ZERO; continue; },
+            _ = runtime::sleep(delay) => {}
         }
         if checked.is_none_or(|time| time.elapsed() >= Duration::from_secs(30)) {
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
-                changed = active.changed() => { if changed.is_err() { break; } checked = None; continue; },
+                changed = active.changed() => { if changed.is_err() { break; } Batch::park(&mut pending); checked = None; continue; },
                 result = identity.sync_request(SyncRequest::ObservabilityStatus) => result,
             }.and_then(|reply| serde_json::from_slice::<wire::ObservabilityStatus>(&reply.body).map_err(|_| ClientError::InvalidResponse));
             match result {
                 Ok(status) => {
                     let enabled = matches!(status.export_mode, wire::ExportMode::Enabled);
-                    events.set_enabled(enabled);
-                    traces.set_enabled(enabled);
+                    if source.set_enabled(enabled).await.is_err() {
+                        record_failure(&state);
+                        delay = Duration::from_secs(5);
+                        continue;
+                    }
                     state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -215,42 +217,42 @@ async fn run(
             continue;
         }
         if pending.is_none() {
-            pending = if trace_turn {
-                traces
-                    .take_batch()
-                    .map(|batch| (batch, true))
-                    .or_else(|| events.take_batch().map(|batch| (batch, false)))
-            } else {
-                events
-                    .take_batch()
-                    .map(|batch| (batch, false))
-                    .or_else(|| traces.take_batch().map(|batch| (batch, true)))
+            pending = match source.next(trace_turn).await {
+                Ok(batch) => batch,
+                Err(()) => {
+                    record_failure(&state);
+                    delay = Duration::from_secs(1);
+                    continue;
+                }
             };
-            attempts = 0;
+            attempts = pending.as_ref().map_or(0, Batch::attempts);
         }
-        let Some((batch, is_trace)) = &pending else {
+        let Some(batch) = &pending else {
             delay = Duration::from_secs(2);
             continue;
         };
         if batch.expired() || attempts >= 8 {
-            pending = None;
+            if let Some(batch) = pending.take() {
+                let _ = batch.discard(&source).await;
+            }
             delay = Duration::ZERO;
             continue;
         }
-        let request = if *is_trace {
+        let request = if batch.trace() {
             SyncRequest::NativeTraces(batch.bytes().to_vec())
         } else {
             SyncRequest::Telemetry(batch.bytes().to_vec())
         };
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
-            changed = active.changed() => { if changed.is_err() { break; } checked = None; continue; },
+            changed = active.changed() => { if changed.is_err() { break; } Batch::park(&mut pending); checked = None; continue; },
             result = identity.sync_request(request) => result,
         }.and_then(|reply| serde_json::from_slice::<wire::IngressReceipt>(&reply.body).map_err(|_| ClientError::InvalidResponse));
         match result {
             Ok(receipt) if matches!(receipt.export_mode, wire::ExportMode::Disabled) => {
-                events.set_enabled(false);
-                traces.set_enabled(false);
+                if source.set_enabled(false).await.is_err() {
+                    record_failure(&state);
+                }
                 pending = None;
                 state
                     .lock()
@@ -265,22 +267,38 @@ async fn run(
                     && i64::from(receipt.accepted) + i64::from(receipt.duplicates)
                         == i64::from(batch.count()) =>
             {
-                let (batch, trace) = pending.take().expect("owned export batch");
-                batch.acknowledge();
-                trace_turn = !trace;
+                let batch = pending.take().expect("owned export batch");
+                trace_turn = !batch.trace();
+                if batch.acknowledge(&source).await.is_err() {
+                    record_failure(&state);
+                    checked = None;
+                    delay = Duration::from_secs(5);
+                    continue;
+                }
                 state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .last_success_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs());
+                    .last_success_at = time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .try_into()
+                    .unwrap_or_default();
                 delay = Duration::from_millis(200);
             }
             Err(error) if terminal(&error) => break,
-            Err(ClientError::Busy) => delay = Duration::from_secs(1),
+            Err(ClientError::Busy) => {
+                Batch::park(&mut pending);
+                delay = Duration::from_secs(1);
+            }
             _ => {
-                batch.failed();
+                if batch.failed(&source).await.is_err() {
+                    record_failure(&state);
+                    pending = None;
+                    checked = None;
+                    delay = Duration::from_secs(5);
+                    continue;
+                }
                 attempts += 1;
+                Batch::park(&mut pending);
                 delay = Duration::from_secs(1 << attempts.min(5));
             }
         }

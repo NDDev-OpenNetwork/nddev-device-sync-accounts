@@ -48,6 +48,9 @@ pub struct View {
     pub server_version: String,
     pub authenticated: bool,
     pub session_verified: bool,
+    pub offline_authorized: bool,
+    pub offline_cache_ready: bool,
+    pub logout_pending: bool,
     pub credential_revalidation_required: bool,
     pub session_checked_at: i64,
     pub user_id: String,
@@ -62,7 +65,8 @@ pub struct View {
 }
 
 /// Public metadata only; signing keys never cross the presentation boundary.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceView {
     pub device_id: String,
     pub display_name: String,
@@ -103,6 +107,8 @@ pub enum ExportPolicy {
 #[derive(Clone, Default)]
 pub struct DeliveryView {
     pub initialized: bool,
+    /// Browser durable-spool availability; native transport does not use it.
+    pub local_persistence_ready: Option<bool>,
     pub policy: ExportPolicy,
     pub paused: bool,
     pub pending: u32,

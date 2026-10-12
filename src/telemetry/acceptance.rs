@@ -29,8 +29,12 @@ async fn actual_signed_client_delivery_and_incidents() {
         debug: None,
     };
     let traces = ClientTraces::new(&config).unwrap();
-    let mut logger =
-        nddev_device_sync_telemetry::install_with_tracer(config, traces.tracer()).unwrap();
+    let mut logger = nddev_device_sync_telemetry::install_client_with_tracer_to(
+        config,
+        traces.tracer(),
+        nddev_device_sync_telemetry::LocalOutput::Stdout,
+    )
+    .unwrap();
     std::panic::set_hook(Box::new(|info| {
         if let Some(location) = info.location() {
             eprintln!("Native acceptance assertion at line {}", location.line());
@@ -290,3 +294,4 @@ async fn actual_signed_client_delivery_and_incidents() {
     traces.shutdown();
     logger.shutdown();
 }
+use std::time::{SystemTime, UNIX_EPOCH};

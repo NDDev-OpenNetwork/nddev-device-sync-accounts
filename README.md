@@ -1,7 +1,7 @@
 # nddev-device-sync-accounts
 
 Rust identity client for [NDDev OpenNetwork](https://nddev.ai), AGPL-3.0-only.
-Email OTP and GitHub sign-in use protocol v2. Tokens stay in native credential
+Email OTP, GitHub and passkey sign-in use protocol v2. Native tokens stay in credential
 stores; the client exposes only session metadata and bounded sign-in progress.
 Harness profiles and vault recovery are not implemented here. Device enrollment, inventory and revocation use the same native session boundary.
 
@@ -27,6 +27,27 @@ uses Credential Manager. Platform declarations are not platform acceptance.
 The Flutter bridge must never export the transport `SessionIssued` or
 `GithubStart` secret fields. Use `View` only. Never log tokens, OTPs or raw bodies.
 
+The WebAssembly adapter uses the same Rust identity/device rules and signed wire
+protocol. It restricts fetches to the application origin, rejects redirects and
+keeps the NDS session in a Secure/HttpOnly cookie. Browser credential records use
+authenticated encryption under a non-extractable Web Crypto key in IndexedDB;
+raw bearer tokens cannot be persisted there. This is browser-profile protection,
+not an OS keychain or protection from compromised same-origin script.
+
+After real session and active-device verification, the client can restore a
+scoped offline authorization until the original session expiry. Two protected
+grant slots and an atomic generation pointer preserve the previous grant across
+an interrupted replacement. The metadata pointer contains no credentials.
+`View` distinguishes current server verification, cached offline authorization
+and a locally completed logout awaiting server revocation. A known local logout
+prevents automatic reuse of a retained cookie. Browser logout removes cached
+vault keys/grants while preserving device identity and encrypted unsent data.
+`authorize_local` is the local secret/replica consumer gate, including changes
+made by another process/tab. Offline availability does not assert server freshness.
+
+`just wasm-check` compiles the browser adapter. Actual browser cookie, native
+keyring, offline restart and later pipeline acceptance remain separate gates.
+
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
 operator export policy, pauses in the background and uses bounded backoff with
@@ -49,3 +70,11 @@ ordinary refresh removes a revoked cached bearer; vault and device keys persist.
 The browser acceptance exercises two actual virtual authenticators, selective
 credential/session revocation, idempotent absence, and preservation of OTP login.
 Physical authenticator qualification is separate.
+
+Browser telemetry uses the SDK's authenticated-scope IndexedDB spool. RAM ingress
+staging runs independently of the common native/browser HTTP sender; a stalled
+request cannot block new durable batches. Retry counters survive page restart,
+and sender locks are released during backoff or backgrounding. The delivery view
+reports the browser's last payload-write readiness separately from transport
+policy and acknowledgements. A readable store does not prove quota recovery.
+Scope changes stop the sender before old queued data can acquire another owner.

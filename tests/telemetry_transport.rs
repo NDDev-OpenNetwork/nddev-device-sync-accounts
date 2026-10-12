@@ -75,12 +75,17 @@ async fn actual_socket_propagates_the_same_trace_as_bounded_client_events() {
                 Err(error) => panic!("bounded accept failed: {}", error.kind()),
             }
         };
-        connection
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        // Winsock may inherit the listener's nonblocking mode on accept.
+        // This owned blocking reader has one total header deadline.
+        connection.set_nonblocking(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
             assert!(bytes.len() < 8192);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("bounded header deadline");
+            connection.set_read_timeout(Some(remaining)).unwrap();
             let mut byte = [0];
             connection.read_exact(&mut byte).unwrap();
             bytes.push(byte[0]);

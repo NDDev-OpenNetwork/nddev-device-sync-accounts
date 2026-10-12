@@ -1,4 +1,4 @@
-use nddev_device_sync_accounts::NativeSessionStore;
+use nddev_device_sync_accounts::SessionStore;
 use nddev_device_sync_telemetry::Config;
 use opentelemetry::trace::TracerProvider;
 use tracing::instrument::WithSubscriber;
@@ -37,10 +37,10 @@ async fn owned_ephemeral_entry_round_trips_and_is_deleted() {
     let scope = format!("https://nds-test-{}.invalid/", uuid::Uuid::new_v4());
     let value = uuid::Uuid::new_v4().to_string();
     async {
-        let store = NativeSessionStore::for_endpoint(&scope).unwrap();
+        let store = SessionStore::for_endpoint(&scope).unwrap();
         assert!(store.read().await.unwrap().is_none());
         store.write(value.as_bytes()).await.unwrap();
-        let restored = NativeSessionStore::for_endpoint(&scope).unwrap();
+        let restored = SessionStore::for_endpoint(&scope).unwrap();
         let read = restored.read().await;
         let deleted = restored.delete().await;
         deleted.unwrap();
