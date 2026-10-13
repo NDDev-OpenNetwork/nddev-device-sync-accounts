@@ -181,6 +181,10 @@ impl IdentityClient {
         async {
             let started = Instant::now();
             let result = operation.await;
+            nddev_device_sync_telemetry::finish_operation_span(
+                &tracing::Span::current(),
+                result.as_ref().is_err_and(terminal_identity_failure),
+            );
             match &result {
                 Ok(view) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
                     event.name=event,duration_ms=started.elapsed().as_millis() as u64,outcome=if view.logout_pending {"pending"} else {"ok"}
@@ -999,6 +1003,91 @@ impl IdentityClient {
         }
         result
         }.instrument(span).await
+    }
+}
+
+/// Project the final typed identity result, after fallback/reconciliation.
+/// Expected authorization, input, admission and conflict outcomes keep their
+/// existing events; they are not technical failures of this operation.
+fn terminal_identity_failure(error: &ClientError) -> bool {
+    match error {
+        ClientError::InvalidResponse
+        | ClientError::Transport
+        | ClientError::Timeout
+        | ClientError::CredentialStore
+        | ClientError::TelemetryUnavailable => true,
+        ClientError::Server(code) => matches!(
+            code.as_str(),
+            "dependency_unavailable" | "request_timeout" | "revision_exhausted"
+        ),
+        ClientError::InvalidEndpoint
+        | ClientError::InvalidInput
+        | ClientError::Cancelled
+        | ClientError::Busy
+        | ClientError::RevalidationRequired
+        | ClientError::Expired
+        | ClientError::DeviceRevoked => false,
+    }
+}
+
+#[cfg(test)]
+mod operation_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_projection_preserves_expected_identity_outcomes() {
+        for error in [
+            ClientError::InvalidResponse,
+            ClientError::Transport,
+            ClientError::Timeout,
+            ClientError::CredentialStore,
+            ClientError::TelemetryUnavailable,
+        ] {
+            assert!(terminal_identity_failure(&error));
+        }
+        for error in [
+            ClientError::InvalidEndpoint,
+            ClientError::InvalidInput,
+            ClientError::Cancelled,
+            ClientError::Busy,
+            ClientError::RevalidationRequired,
+            ClientError::Expired,
+            ClientError::DeviceRevoked,
+        ] {
+            assert!(!terminal_identity_failure(&error));
+        }
+        for (code, failed) in [
+            ("authentication_failed", false),
+            ("authorization_denied", false),
+            ("challenge_expired", false),
+            ("cursor_expired", false),
+            ("dependency_unavailable", true),
+            ("device_revoked", false),
+            ("idempotency_conflict", false),
+            ("invalid_request", false),
+            ("invalid_signature", false),
+            ("method_unavailable", false),
+            ("operation_conflict", false),
+            ("rate_limited", false),
+            ("recent_authentication_required", false),
+            ("replayed_nonce", false),
+            ("request_timeout", true),
+            ("revision_exhausted", true),
+            ("server_busy", false),
+            ("vault_key_registration_required", false),
+        ] {
+            let response: wire::Error =
+                decode(format!("{{\"error\":\"{code}\"}}").as_bytes()).unwrap();
+            let code = serde_json::to_value(response.error).unwrap();
+            assert_eq!(
+                terminal_identity_failure(&ClientError::Server(code.as_str().unwrap().into())),
+                failed
+            );
+        }
+        assert!(matches!(
+            decode::<wire::Error>(br#"{"error":"unrecognized_server_error"}"#),
+            Err(ClientError::InvalidResponse)
+        ));
     }
 }
 
