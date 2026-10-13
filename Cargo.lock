@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.18"
+version = "0.0.1-alpha.19"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1621,7 +1621,9 @@ dependencies = [
  "nddev-device-sync-http-signatures",
  "nddev-device-sync-telemetry",
  "opentelemetry",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "reqwest",
  "ring",
  "rusqlite",
@@ -1669,8 +1671,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.8"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability?rev=e4eb0c57df475eaea3769b995a7e8343cb3a55b5#e4eb0c57df475eaea3769b995a7e8343cb3a55b5"
+version = "0.0.1-alpha.9"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability?rev=bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea#bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea"
 dependencies = [
  "android_log-sys",
  "chrono",

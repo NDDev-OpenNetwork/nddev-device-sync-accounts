@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.18"
+version = "0.0.1-alpha.19"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -25,7 +25,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "e4eb0c57df475eaea3769b995a7e8343cb3a55b5", features = ["client-traces"] }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea", features = ["client-traces"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -52,6 +52,8 @@ rustls-platform-verifier = "0.7.1"
 [dev-dependencies]
 futures = "0.3"
 uuid = { version = "1.27", features = ["v4", "v7"] }
+prost = "0.14"
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ring = {version="0.17", features=["wasm32_unknown_unknown_js"]}
