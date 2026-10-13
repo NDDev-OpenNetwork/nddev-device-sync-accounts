@@ -9,6 +9,7 @@ pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
 mod offline;
+pub use offline::LocalUseFence;
 pub mod runtime;
 mod store;
 mod transport;
@@ -26,7 +27,10 @@ use http::{Method, StatusCode};
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use store::OperationPermit;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
@@ -84,6 +88,9 @@ struct State {
     view: View,
     flow: Option<Flow>,
     session_deadline: Option<Instant>,
+    // Local-use handles expire on client cancellation, independently of request
+    // tokens that rotate for each NDS operation. No authority is stored here.
+    local_use_generation: Arc<()>,
 }
 
 /// One bounded operation per client; concurrent calls fail instead of queuing.
@@ -132,6 +139,10 @@ impl IdentityClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cancel();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .local_use_generation = Arc::default();
     }
 
     pub fn view(&self) -> View {
@@ -668,6 +679,10 @@ impl IdentityClient {
         let completion = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
         completion.cancel();
         self.clear_flow();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .local_use_generation = Arc::default();
     }
 
     fn finish_flow(
