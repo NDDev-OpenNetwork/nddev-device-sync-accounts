@@ -371,8 +371,48 @@ impl IdentityClient {
 mod acceptance {
     use super::*;
     use futures::FutureExt;
+    use nddev_device_sync_telemetry::{Config, ExportFeed, client_traces::ClientTraces};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value, trace::v1::Span,
+    };
+    use prost::Message;
     use serde_json::Value;
     use std::{path::PathBuf, time::Duration};
+    use tracing::instrument::WithSubscriber;
+
+    fn process_spans(feed: &ExportFeed) -> Vec<Span> {
+        let mut spans = Vec::new();
+        while let Some(batch) = feed.take_batch() {
+            let decoded = ExportTraceServiceRequest::decode(batch.bytes()).unwrap();
+            spans.extend(
+                decoded
+                    .resource_spans
+                    .into_iter()
+                    .flat_map(|resource| resource.scope_spans)
+                    .flat_map(|scope| scope.spans)
+                    .filter(|span| {
+                        span.attributes.iter().any(|field| {
+                            field.key == "scope"
+                                && field.value.as_ref().and_then(|v| v.value.as_ref())
+                                    == Some(&any_value::Value::StringValue("process".into()))
+                        })
+                    }),
+            );
+            batch.acknowledge();
+        }
+        spans
+    }
+
+    fn assert_recovered_operation(feed: &ExportFeed) {
+        let spans = process_spans(feed);
+        assert_eq!(spans.len(), 1);
+        let status = spans[0].status.as_ref().unwrap();
+        assert_eq!(
+            status.code, 0,
+            "handled network failure is not terminal failure"
+        );
+        assert!(status.message.is_empty());
+    }
 
     #[tokio::test]
     #[ignore = "requires an owned controllable PostgreSQL/Mailpit fixture, private state root and real unlocked keyring"]
@@ -396,6 +436,23 @@ mod acceptance {
         assert!(!control.exists());
         let client = IdentityClient::new(endpoint).unwrap();
         assert!(client.store.read().await.unwrap().is_none());
+        let config = Config {
+            service: "nddev-device-sync-client".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop".into(),
+            commit: "unknown".into(),
+            channel: "alpha".into(),
+            standards: "unreleased".into(),
+            environment: "test".into(),
+            target_prefixes: vec!["nds_accounts".into()],
+            default_module: "accounts".into(),
+            debug: None,
+        };
+        let traces = ClientTraces::new(&config).unwrap();
+        let feed = traces.subscribe().unwrap();
+        let (subscriber, _) =
+            nddev_device_sync_telemetry::subscriber(config, std::io::sink(), traces.tracer())
+                .unwrap();
         let mut owned_device = None;
         let result = std::panic::AssertUnwindSafe(async {
             client.refresh().await.unwrap();
@@ -465,7 +522,9 @@ mod acceptance {
                 .unwrap();
             set_mode(&receipt, &control, "offline").await;
             let recreated = IdentityClient::new(endpoint).unwrap();
+            process_spans(&feed);
             let offline = recreated.refresh().await.unwrap();
+            assert_recovered_operation(&feed);
             assert!(
                 offline.authenticated && offline.offline_authorized && !offline.session_verified
             );
@@ -473,7 +532,9 @@ mod acceptance {
             assert_eq!(offline.expires_at, enrolled.expires_at);
             assert!(offline.session_checked_at <= OffsetDateTime::now_utc().unix_timestamp());
             recreated.authorize_local().await.unwrap();
+            process_spans(&feed);
             let signed_out = recreated.logout().await.unwrap();
+            assert_recovered_operation(&feed);
             assert!(!signed_out.authenticated && signed_out.logout_pending);
             assert!(
                 client.authorize_local().await.is_err(),
@@ -507,6 +568,7 @@ mod acceptance {
             );
         })
         .catch_unwind()
+        .with_subscriber(tracing::Dispatch::new(subscriber))
         .await;
         // The fixture and every native entry are explicitly owned. Cleanup is
         // also attempted after assertion failure, without touching real scopes.
