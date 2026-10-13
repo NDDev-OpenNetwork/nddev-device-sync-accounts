@@ -1,5 +1,12 @@
 # nddev-device-sync-accounts
 
+Rust callers may capture `local_use_fence` and call `validate_local_use` around
+external awaits. The opaque handle binds this client/cancellation lifetime to
+the existing durable authorization generation, protected session binding and
+scope. It has no Debug/serialization/FFI and contains no raw token. Checks reuse
+the current local expiry/revocation/logout policy; they do not refresh or extend
+authority, or make an already sent external request atomically revocable.
+
 Rust identity client for [NDDev OpenNetwork](https://nddev.ai), AGPL-3.0-only.
 Email OTP, GitHub and passkey sign-in use protocol v2. Native tokens stay in credential
 stores; the client exposes only session metadata and bounded sign-in progress.

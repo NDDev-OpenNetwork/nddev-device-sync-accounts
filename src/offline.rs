@@ -16,6 +16,16 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+/// Opaque point-in-time local-use observation, never a new authorization grant.
+/// Rust callers recheck it around external awaits; no token/key or serializable
+/// handle is exposed. A sent external request cannot be revoked retroactively.
+pub struct LocalUseFence {
+    client: std::sync::Weak<()>,
+    durable: Fence,
+    scope: CachedDeviceAuthorization,
+    session_binding: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cached {
@@ -85,6 +95,15 @@ impl Cached {
 
 impl IdentityClient {
     async fn cached(&self, credential: &SessionCredential) -> Result<Option<Cached>, ClientError> {
+        Ok(self
+            .cached_with_fence(credential)
+            .await?
+            .map(|(cached, _)| cached))
+    }
+    async fn cached_with_fence(
+        &self,
+        credential: &SessionCredential,
+    ) -> Result<Option<(Cached, Fence)>, ClientError> {
         let Some(fence) = self.store.authorization_fence(None).await? else {
             return Ok(None);
         };
@@ -112,10 +131,10 @@ impl IdentityClient {
         cached.validate(&self.origin(), &fence, credential)?;
         // A sign-out/revocation or slot publication may race a protected-store
         // read. Do not publish a decision from a superseded metadata generation.
-        if self.store.authorization_fence(None).await? != Some(fence) {
+        if self.store.authorization_fence(None).await?.as_ref() != Some(&fence) {
             return Err(ClientError::Busy);
         }
-        Ok(Some(cached))
+        Ok(Some((cached, fence)))
     }
 
     pub(crate) async fn persist_offline_authorization(&self) {
@@ -275,9 +294,68 @@ impl IdentityClient {
     /// Local key/replica consumers must consult the durable shared decision,
     /// including a sign-out completed by another process or browser tab.
     pub async fn authorize_local(&self) -> Result<(), ClientError> {
+        self.authorized_local_with_fence().await.map(|_| ())
+    }
+
+    /// Capture the existing protected scope/session and durable generation for
+    /// this client. Cancellation invalidates the observation without sign-out.
+    pub async fn local_use_fence(&self) -> Result<LocalUseFence, ClientError> {
+        let client = self.local_use_generation();
+        let (cached, durable) = self.authorized_local_with_fence().await?;
+        self.check_local_use_generation(&client)?;
+        Ok(LocalUseFence {
+            client,
+            durable,
+            scope: cached.authorization,
+            session_binding: cached.credential_fingerprint,
+        })
+    }
+
+    /// Recheck current protected authorization, not just owner IDs. Same-owner
+    /// sign-out/relogin or another process/tab generation change rejects a late
+    /// result. This method does not refresh or extend the underlying grant.
+    pub async fn validate_local_use(&self, fence: &LocalUseFence) -> Result<(), ClientError> {
+        self.check_local_use_generation(&fence.client)?;
+        let (cached, durable) = self.authorized_local_with_fence().await?;
+        let scope = cached.authorization;
+        if durable != fence.durable
+            || cached.credential_fingerprint != fence.session_binding
+            || scope.origin != fence.scope.origin
+            || scope.user_id != fence.scope.user_id
+            || scope.tenant_id != fence.scope.tenant_id
+            || scope.device_id != fence.scope.device_id
+            || scope.verified_at_ms != fence.scope.verified_at_ms
+            || scope.expires_at_ms != fence.scope.expires_at_ms
+        {
+            return Err(ClientError::RevalidationRequired);
+        }
+        self.check_local_use_generation(&fence.client)
+    }
+
+    fn local_use_generation(&self) -> std::sync::Weak<()> {
+        std::sync::Arc::downgrade(
+            &self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .local_use_generation,
+        )
+    }
+    fn check_local_use_generation(
+        &self,
+        expected: &std::sync::Weak<()>,
+    ) -> Result<(), ClientError> {
+        if std::sync::Weak::ptr_eq(expected, &self.local_use_generation()) {
+            Ok(())
+        } else {
+            Err(ClientError::RevalidationRequired)
+        }
+    }
+
+    async fn authorized_local_with_fence(&self) -> Result<(Cached, Fence), ClientError> {
         let credential = self.session_credential().await?;
-        let cached = self
-            .cached(&credential)
+        let (cached, fence) = self
+            .cached_with_fence(&credential)
             .await?
             .ok_or(ClientError::RevalidationRequired)?;
         let view = self.view();
@@ -294,7 +372,7 @@ impl IdentityClient {
             self.require_revalidation();
             return Err(ClientError::RevalidationRequired);
         }
-        Ok(())
+        Ok((cached, fence))
     }
 
     pub(crate) async fn finish_pending_logout(
@@ -364,6 +442,28 @@ impl IdentityClient {
             .credential_store_ready = true;
         tracing::event!(target:"nds_accounts",tracing::Level::INFO,{event.name="identity.remote_logout.completed",outcome="ok"});
         Ok(true)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod local_use_tests {
+    use super::*;
+
+    #[test]
+    fn local_use_is_client_bound_and_cancel_survives_request_token_rotation() {
+        let client = IdentityClient::new("https://local-use.example").unwrap();
+        let other = IdentityClient::new("https://local-use.example").unwrap();
+        let generation = client.local_use_generation();
+        assert!(client.check_local_use_generation(&generation).is_ok());
+        assert!(other.check_local_use_generation(&generation).is_err());
+        *client.cancellation.lock().unwrap() = CancellationToken::new();
+        assert!(client.check_local_use_generation(&generation).is_ok());
+        client.cancel();
+        *client.cancellation.lock().unwrap() = CancellationToken::new();
+        assert!(client.check_local_use_generation(&generation).is_err());
+        let renewed = client.local_use_generation();
+        client.cancel_sign_in();
+        assert!(client.check_local_use_generation(&renewed).is_err());
     }
 }
 
