@@ -4,10 +4,11 @@ pub mod observability_wire;
 pub mod screen;
 pub mod screen_wire;
 mod sync;
+pub mod sync3_wire;
 pub mod sync_wire;
 pub mod telemetry;
 pub mod vault_wire;
-pub use sync::{SyncReply, SyncRequest};
+pub use sync::{SyncExpiry, SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
 mod offline;
@@ -961,6 +962,7 @@ impl IdentityClient {
             return Err(ClientError::InvalidInput);
         }
         let signed = signature.is_some();
+        let capabilities_request = signed && method == Method::GET && path == "/v3/sync";
         let span = if path.starts_with("/v2/observability/") {
             tracing::Span::none()
         } else {
@@ -990,7 +992,28 @@ impl IdentityClient {
             let (status, bytes) = self.transport_request(WireRequest {
                 method, path, body, token, locale, signature,
             }, propagation).await?;
+            if signed {
+                sync::validate_v3_reply_size(path, status, bytes.len())?;
+            }
             if !status.is_success() {
+                // Older servers have no capabilities route. Preserve only this
+                // fixed-route absence; Core still owns writer-mode admission.
+                if capabilities_request && status == StatusCode::NOT_FOUND {
+                    return Ok((status, bytes));
+                }
+                // Lifecycle expiration is a typed Unknown result. Keep its exact
+                // response bytes; transport never changes durable pending work.
+                if signed && status == StatusCode::GONE {
+                    let route = path.split('?').next().unwrap_or_default();
+                    if matches!(route, "/v3/sync/operations" | "/v3/sync/history" | "/v3/sync/base") {
+                        sync::decode_expired_v3(&bytes)?;
+                        return Ok((status, bytes));
+                    }
+                    if route == "/v2/sync/operations" {
+                        sync::decode_expired_v2(&bytes)?;
+                        return Ok((status, bytes));
+                    }
+                }
                 // A retained revision conflict is a sync result, not a generic
                 // error. Preserve its exact bytes for the durable client inbox.
                 if signed && status==StatusCode::CONFLICT && matches!(serde_json::from_slice::<sync_wire::Sync>(&bytes), Ok(sync_wire::Sync::Conflict(_))) {

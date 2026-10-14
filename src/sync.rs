@@ -21,6 +21,18 @@ pub enum SyncRequest {
         after: u64,
         limit: u16,
     },
+    /// Explicit lifecycle3 routes; callers retain the original append bytes.
+    CapabilitiesV3,
+    AppendV3(Vec<u8>),
+    HistoryV3 {
+        after: u64,
+        limit: u16,
+    },
+    BaseV3 {
+        base: u64,
+        after_member: u64,
+        limit: u16,
+    },
     VaultKey(Vec<u8>),
     Telemetry(Vec<u8>),
     NativeTraces(Vec<u8>),
@@ -38,6 +50,198 @@ pub struct SyncReply {
     pub status: u16,
     pub body: Vec<u8>,
 }
+impl SyncRequest {
+    fn is_v3(&self) -> bool {
+        matches!(
+            self,
+            Self::CapabilitiesV3 | Self::AppendV3(_) | Self::HistoryV3 { .. } | Self::BaseV3 { .. }
+        )
+    }
+    fn prepare(self) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
+        match self {
+            SyncRequest::Telemetry(body) => {
+                if body.is_empty() || body.len() > 65_536 {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v2/observability/events".into(), Some(body)))
+            }
+            SyncRequest::NativeTraces(body) => {
+                if body.is_empty() || body.len() > 65_536 {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v2/observability/traces".into(), Some(body)))
+            }
+            SyncRequest::ObservabilityStatus => {
+                Ok((Method::GET, "/v2/observability/status".into(), None))
+            }
+            SyncRequest::Incidents { after } => {
+                if after.len() > 128 || !after.is_empty() && !crate::valid_id(&after) {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((
+                    Method::GET,
+                    format!("/v2/observability/incidents?after={after}"),
+                    None,
+                ))
+            }
+            SyncRequest::IncidentAction { id, silence, body } => {
+                if !crate::valid_id(&id) || body.len() > 1024 {
+                    return Err(ClientError::InvalidInput);
+                }
+                let action = if silence { "silence" } else { "acknowledge" };
+                Ok((
+                    Method::POST,
+                    format!("/v2/observability/incidents/{id}/{action}"),
+                    Some(body),
+                ))
+            }
+            SyncRequest::VaultKey(body) => {
+                if body.len() > 1024 {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v2/vault/key".into(), Some(body)))
+            }
+            SyncRequest::Append(body) => {
+                if body.len() > nddev_device_sync_domain::sync::MAX_OPERATION_BYTES {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v2/sync/operations".into(), Some(body)))
+            }
+            SyncRequest::CapabilitiesV3 => Ok((Method::GET, "/v3/sync".into(), None)),
+            SyncRequest::AppendV3(body) => {
+                if body.is_empty()
+                    || body.len() > nddev_device_sync_domain::sync::MAX_OPERATION_BYTES
+                {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v3/sync/operations".into(), Some(body)))
+            }
+            SyncRequest::HistoryV3 { after, limit } => {
+                if after > nddev_device_sync_domain::sync::MAX_REVISION
+                    || !(1..=nddev_device_sync_domain::sync::MAX_PAGE_ITEMS as u16).contains(&limit)
+                {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((
+                    Method::GET,
+                    format!("/v3/sync/history?after_seq={after}&limit={limit}"),
+                    None,
+                ))
+            }
+            SyncRequest::BaseV3 {
+                base,
+                after_member,
+                limit,
+            } => {
+                if base > nddev_device_sync_domain::sync::MAX_REVISION
+                    || after_member > nddev_device_sync_domain::sync::MAX_REVISION
+                    || !(1..=nddev_device_sync_domain::sync::MAX_PAGE_ITEMS as u16).contains(&limit)
+                {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((
+                    Method::GET,
+                    format!(
+                        "/v3/sync/base?base_seq={base}&after_member_seq={after_member}&limit={limit}"
+                    ),
+                    None,
+                ))
+            }
+            SyncRequest::Page { after, limit } => {
+                if after > nddev_device_sync_domain::sync::MAX_REVISION
+                    || !(1..=100).contains(&limit)
+                {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((
+                    Method::GET,
+                    format!("/v2/sync/operations?after_seq={after}&limit={limit}"),
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+/// An expired retry/cursor is an Unknown outcome, never permission to replace
+/// an operation ID, reconstruct its body or delete pending work.
+pub enum SyncExpiry {
+    V3(crate::sync3_wire::SyncExpired),
+    /// The deployed v2 error remains unchanged and carries no new floor/header.
+    V2CursorExpired,
+}
+impl SyncReply {
+    pub fn expiry(&self) -> Result<Option<SyncExpiry>, ClientError> {
+        if self.status != 410 {
+            return Ok(None);
+        }
+        if let Ok(expired) = decode_expired_v3(&self.body) {
+            return Ok(Some(SyncExpiry::V3(expired)));
+        }
+        decode_expired_v2(&self.body)?;
+        Ok(Some(SyncExpiry::V2CursorExpired))
+    }
+}
+pub(crate) fn decode_expired_v3(
+    bytes: &[u8],
+) -> Result<crate::sync3_wire::SyncExpired, ClientError> {
+    use nddev_device_sync_domain::sync::history::HistoryVersion;
+    if bytes.len() > crate::MAX_BODY {
+        return Err(ClientError::InvalidResponse);
+    }
+    let value: crate::sync3_wire::SyncExpired =
+        serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
+    let floor = u64::try_from(value.floor_seq).map_err(|_| ClientError::InvalidResponse)?;
+    let head = u64::try_from(value.head_seq).map_err(|_| ClientError::InvalidResponse)?;
+    if value.schema_version != 3 {
+        return Err(ClientError::InvalidResponse);
+    }
+    HistoryVersion {
+        floor,
+        head,
+        base: floor,
+    }
+    .validate()
+    .map_err(|_| ClientError::InvalidResponse)?;
+    Ok(value)
+}
+pub(crate) fn decode_expired_v2(bytes: &[u8]) -> Result<(), ClientError> {
+    if bytes.len() > crate::MAX_BODY {
+        return Err(ClientError::InvalidResponse);
+    }
+    let value: crate::sync_wire::Error =
+        serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
+    if matches!(value.error, crate::sync_wire::ErrorEnum::CursorExpired) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidResponse)
+    }
+}
+
+pub(crate) fn validate_v3_reply_size(
+    path: &str,
+    status: http::StatusCode,
+    bytes: usize,
+) -> Result<(), ClientError> {
+    use nddev_device_sync_domain::sync::{MAX_PAGE_BYTES, MAX_RESULT_BYTES};
+    let route = path.split('?').next().unwrap_or_default();
+    let maximum = match (route, status) {
+        ("/v3/sync/history" | "/v3/sync/base", http::StatusCode::OK) => MAX_PAGE_BYTES,
+        ("/v3/sync/operations", http::StatusCode::CREATED | http::StatusCode::CONFLICT) => {
+            MAX_RESULT_BYTES
+        }
+        _ => crate::MAX_BODY,
+    };
+    if bytes > maximum {
+        Err(ClientError::InvalidResponse)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
 struct Key {
     key: ed25519_dalek::SigningKey,
     id: String,
@@ -175,7 +379,12 @@ impl IdentityClient {
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation().await?;
-        self.authorize_local().await?;
+        let fence = if request.is_v3() {
+            Some(self.local_use_fence().await?)
+        } else {
+            self.authorize_local().await?;
+            None
+        };
         let store = self.device_store()?;
         let view = self.view();
         let current = view
@@ -193,68 +402,10 @@ impl IdentityClient {
             id: current.device_id.clone(),
         };
         let token = self.session_credential().await?;
-        let (method, path, body) = match request {
-            SyncRequest::Telemetry(body) => {
-                if body.is_empty() || body.len() > 65_536 {
-                    return Err(ClientError::InvalidInput);
-                }
-                (Method::POST, "/v2/observability/events".into(), Some(body))
-            }
-            SyncRequest::NativeTraces(body) => {
-                if body.is_empty() || body.len() > 65_536 {
-                    return Err(ClientError::InvalidInput);
-                }
-                (Method::POST, "/v2/observability/traces".into(), Some(body))
-            }
-            SyncRequest::ObservabilityStatus => {
-                (Method::GET, "/v2/observability/status".into(), None)
-            }
-            SyncRequest::Incidents { after } => {
-                if after.len() > 128 || !after.is_empty() && !crate::valid_id(&after) {
-                    return Err(ClientError::InvalidInput);
-                }
-                (
-                    Method::GET,
-                    format!("/v2/observability/incidents?after={after}"),
-                    None,
-                )
-            }
-            SyncRequest::IncidentAction { id, silence, body } => {
-                if !crate::valid_id(&id) || body.len() > 1024 {
-                    return Err(ClientError::InvalidInput);
-                }
-                let action = if silence { "silence" } else { "acknowledge" };
-                (
-                    Method::POST,
-                    format!("/v2/observability/incidents/{id}/{action}"),
-                    Some(body),
-                )
-            }
-            SyncRequest::VaultKey(body) => {
-                if body.len() > 1024 {
-                    return Err(ClientError::InvalidInput);
-                }
-                (Method::POST, "/v2/vault/key".into(), Some(body))
-            }
-            SyncRequest::Append(body) => {
-                if body.len() > nddev_device_sync_domain::sync::MAX_OPERATION_BYTES {
-                    return Err(ClientError::InvalidInput);
-                }
-                (Method::POST, "/v2/sync/operations".into(), Some(body))
-            }
-            SyncRequest::Page { after, limit } => {
-                if after > nddev_device_sync_domain::sync::MAX_REVISION
-                    || !(1..=100).contains(&limit)
-                {
-                    return Err(ClientError::InvalidInput);
-                }
-                (
-                    Method::GET,
-                    format!("/v2/sync/operations?after_seq={after}&limit={limit}"),
-                    None,
-                )
-            }
-        };
+        if let Some(fence) = &fence {
+            self.validate_local_use(fence).await?;
+        }
+        let (method, path, body) = request.prepare()?;
         let target = self
             .endpoint
             .join(&path)
@@ -276,7 +427,7 @@ impl IdentityClient {
             now,
         )
         .map_err(|_| ClientError::InvalidInput)?;
-        let (status, body) = self
+        let response = self
             .request_bytes(
                 WireRequest {
                     method,
@@ -288,7 +439,14 @@ impl IdentityClient {
                 },
                 &cancel,
             )
-            .await?;
+            .await;
+        if let Some(fence) = &fence {
+            self.validate_local_use(fence).await?;
+            if cancel.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+        }
+        let (status, body) = response?;
         Ok(SyncReply {
             status: status.as_u16(),
             body,
