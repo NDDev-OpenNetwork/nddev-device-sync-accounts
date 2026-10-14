@@ -1,6 +1,8 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
 pub mod device_wire;
 pub mod observability_wire;
+pub mod screen;
+pub mod screen_wire;
 mod sync;
 pub mod sync_wire;
 pub mod telemetry;
@@ -91,6 +93,7 @@ struct State {
     // Local-use handles expire on client cancellation, independently of request
     // tokens that rotate for each NDS operation. No authority is stored here.
     local_use_generation: Arc<()>,
+    rds_key: std::sync::Weak<Mutex<Option<screen::KeyMaterial>>>,
 }
 
 /// One bounded operation per client; concurrent calls fail instead of queuing.
@@ -101,6 +104,12 @@ pub struct IdentityClient {
     store: SessionStore,
     state: Mutex<State>,
     cancellation: Mutex<CancellationToken>,
+}
+
+impl Drop for IdentityClient {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl IdentityClient {
@@ -139,10 +148,9 @@ impl IdentityClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cancel();
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .local_use_generation = Arc::default();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.local_use_generation = Arc::default();
+        screen::close_key(&mut state);
     }
 
     pub fn view(&self) -> View {
@@ -830,6 +838,7 @@ impl IdentityClient {
 
     fn clear_session(&self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        screen::close_key(&mut s);
         s.session_deadline = None;
         s.view.authenticated = false;
         s.view.session_verified = false;
@@ -850,6 +859,7 @@ impl IdentityClient {
         self.clear_flow();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.view.session_verified = false;
+        screen::close_key(&mut state);
         state.view.credential_revalidation_required = true;
         state.view.offline_authorized = false;
         state.view.offline_cache_ready = false;
@@ -956,7 +966,9 @@ impl IdentityClient {
         };
         let context = nddev_device_sync_telemetry::trace_context(&span);
         // Normalize device paths before recording them; queries and IDs stay out.
-        let route = if path.starts_with("/v2/devices/")
+        let route = if let Some(route) = screen::route_template(path) {
+            route
+        } else if path.starts_with("/v2/devices/")
             && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
         {
             "/v2/devices/{device_id}"
@@ -1185,6 +1197,7 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
             || OffsetDateTime::parse(&state.view.expires_at, &Rfc3339)
                 .is_ok_and(|expires| expires <= wall_time))
     {
+        screen::close_key(state);
         state.view.authenticated = false;
         state.view.session_verified = false;
         state.view.offline_authorized = false;
