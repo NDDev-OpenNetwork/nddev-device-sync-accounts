@@ -117,7 +117,7 @@ impl Source {
                         .saturating_sub(stored.traces_reported.failures),
                     disk.traces.failures,
                 );
-                view.last_success_at = view.last_success_at.max(disk.last_success_at);
+                view.last_success_at = disk.last_success_at;
             }
         }
     }
@@ -204,7 +204,11 @@ impl Source {
                     .map(|b| (b, false))
                     .or_else(|| self.traces.take_batch().map(|b| (b, true)))
             };
-            Ok(selected.map(|(batch, trace)| Batch { batch, trace }))
+            Ok(selected.map(|(batch, trace)| Batch {
+                batch,
+                trace,
+                accepted: None,
+            }))
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -224,7 +228,11 @@ impl Source {
                     return Err(());
                 }
             };
-            Ok(batch.map(|batch| Batch { batch, sender }))
+            Ok(batch.map(|batch| Batch {
+                batch,
+                sender,
+                accepted: None,
+            }))
         }
     }
     #[cfg(target_arch = "wasm32")]
@@ -300,6 +308,7 @@ impl Source {
     }
 }
 pub(super) struct Batch {
+    accepted: Option<i64>,
     #[cfg(not(target_arch = "wasm32"))]
     batch: ExportBatch,
     #[cfg(not(target_arch = "wasm32"))]
@@ -310,12 +319,14 @@ pub(super) struct Batch {
     sender: browser_queue::Sender,
 }
 impl Batch {
-    /// Native RAM batches must remain owned; persisted browser batches can be
-    /// reselected after retry/pause without holding a cross-tab sender lock.
+    /// Unknown browser batches can be reselected after retry/pause. A known
+    /// receipt retains its exact batch and sender for local settlement only.
     pub fn park(pending: &mut Option<Self>) {
         #[cfg(target_arch = "wasm32")]
         {
-            *pending = None;
+            if pending.as_ref().is_some_and(|batch| !batch.received()) {
+                *pending = None;
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -351,16 +362,33 @@ impl Batch {
             u32::from(self.batch.attempts())
         }
     }
-    pub async fn acknowledge(self, source: &Source) -> Result<(), ()> {
+    pub fn received(&self) -> bool {
+        self.accepted.is_some()
+    }
+    pub fn receive(&mut self, receipt: &crate::observability_wire::IngressReceipt) -> bool {
+        if self.received() {
+            return false;
+        }
+        self.accepted = super::receipt::accepted_count(self.trace(), self.count(), receipt);
+        self.received()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn full_receipt(&self) -> bool {
+        self.accepted == Some(i64::from(self.count()))
+    }
+    pub async fn acknowledge(&mut self, source: &Source) -> Result<(), ()> {
+        let accepted = self.accepted.ok_or(())?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = source;
-            self.batch.acknowledge();
-            Ok(())
+            self.batch.acknowledge_count(accepted).map_err(|_| ())
         }
         #[cfg(target_arch = "wasm32")]
         {
-            source.remember(self.sender.acknowledge(&self.batch).await, false)
+            source.remember(
+                self.sender.acknowledge_count(&self.batch, accepted).await,
+                false,
+            )
         }
     }
     pub async fn failed(&self, source: &Source) -> Result<(), ()> {
