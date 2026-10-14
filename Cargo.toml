@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.23"
+version = "0.0.1-alpha.24"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -30,6 +30,7 @@ opentelemetry = { version = "0.33.1", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
 zeroize = "1.8"
+uuid = { version = "1.27", features = ["v4", "v7"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
@@ -51,7 +52,6 @@ rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
 futures = "0.3"
-uuid = { version = "1.27", features = ["v4", "v7"] }
 prost = "0.14"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
@@ -61,6 +61,7 @@ time = {version="0.3", features=["wasm-bindgen"]}
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "=0.4.79"
 js-sys = "=0.3.106"
+uuid = { version = "1.27", features = ["js"] }
 web-time = "1.1"
 futures = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }

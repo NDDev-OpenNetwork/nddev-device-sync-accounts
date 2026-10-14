@@ -17,6 +17,7 @@ mod fence;
 pub(crate) use fence::{Fence, FenceMode};
 mod admission;
 pub(crate) use admission::OperationPermit;
+pub(crate) use admission::RdsLease;
 
 const SERVICE: &str = "ai.nddev.nds.session.v2";
 
@@ -84,6 +85,19 @@ impl SessionStore {
         let mut store = self.device_store(tenant, user);
         store.service = "ai.nddev.nds.vault.v1";
         store
+    }
+
+    pub(crate) fn rds_store(&self, tenant: &str, user: &str, device: &str) -> Self {
+        let mut digest = Sha256::new();
+        for value in ["rds.v1", &self.key, tenant, user, device] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        Self {
+            service: "ai.nddev.nds.rds.v1",
+            key: format!("{:x}", digest.finalize()),
+            owner: self.owner.clone(),
+        }
     }
 
     pub(crate) fn offline_store(&self, slot: u8) -> Self {

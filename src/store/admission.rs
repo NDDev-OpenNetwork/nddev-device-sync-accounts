@@ -8,6 +8,11 @@ pub(crate) struct OperationPermit {
     _lease: Arc<Lease>,
 }
 
+/// One RDS endpoint owns this purpose lock, without holding identity admission.
+pub(crate) struct RdsLease {
+    _lease: Arc<Lease>,
+}
+
 pub(super) struct Lease {
     #[cfg(not(target_arch = "wasm32"))]
     _file: std::fs::File,
@@ -83,6 +88,26 @@ mod web {
 }
 
 impl SessionStore {
+    pub(crate) async fn rds_lease(&self) -> Result<RdsLease, ClientError> {
+        if self.service != "ai.nddev.nds.rds.v1" {
+            return Err(ClientError::InvalidInput);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let lease = {
+            let key = self.key.clone();
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::task::spawn_blocking(move || acquire_native(&key).map(Arc::new)),
+            )
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::CredentialStore)??
+        };
+        #[cfg(target_arch = "wasm32")]
+        let lease = web::acquire(&self.key).await?;
+        Ok(RdsLease { _lease: lease })
+    }
+
     pub(crate) async fn activate_operation(
         &self,
         local: OwnedSemaphorePermit,
