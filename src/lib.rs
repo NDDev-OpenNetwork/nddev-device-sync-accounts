@@ -11,7 +11,7 @@ pub use sync::{SyncReply, SyncRequest};
 mod devices;
 pub mod health_wire;
 mod offline;
-pub use offline::LocalUseFence;
+pub use offline::{LocalUseFence, LocalUseLifetime};
 pub mod runtime;
 mod store;
 mod transport;
@@ -818,6 +818,9 @@ impl IdentityClient {
         // the last device observation until the inventory refresh replaces it.
         // Local operations still consult the protected grant on every use.
         if !preserve_devices {
+            // A newly accepted sign-in owns a new local lifetime, even for the
+            // same owner. Late work from the preceding session cannot publish.
+            s.local_use_generation = Arc::default();
             s.view.offline_cache_ready = false;
             s.view.current_device_id.clear();
             s.view.devices.clear();
