@@ -32,6 +32,12 @@ impl LocalUseFence {
     }
 }
 
+/// Opaque local cancellation observation, usable before device enrollment.
+/// It contains no authorization, key or durable grant and is not serializable.
+pub struct LocalUseLifetime {
+    client: std::sync::Weak<()>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cached {
@@ -307,15 +313,52 @@ impl IdentityClient {
     /// Capture the existing protected scope/session and durable generation for
     /// this client. Cancellation invalidates the observation without sign-out.
     pub async fn local_use_fence(&self) -> Result<LocalUseFence, ClientError> {
-        let client = self.local_use_generation();
+        let lifetime = self.local_use_lifetime();
+        self.local_use_fence_from(&lifetime).await
+    }
+
+    /// Capture this client's existing lifetime without I/O or authorization.
+    /// Call before the first await when enrollment must precede a full fence.
+    pub fn local_use_lifetime(&self) -> LocalUseLifetime {
+        LocalUseLifetime {
+            client: self.local_use_generation(),
+        }
+    }
+
+    /// Check only the captured local lifetime, without protected I/O or a grant.
+    /// Cleanup must hold its publication/cancellation guard while checking and
+    /// detaching owners, so an old failure cannot remove a replacement's tasks.
+    pub fn check_captured_local_use_lifetime(
+        &self,
+        lifetime: &LocalUseLifetime,
+    ) -> Result<(), ClientError> {
+        self.check_local_use_generation(&lifetime.client)
+    }
+
+    /// Acquire the existing protected scope under the original local lifetime.
+    /// Cancellation cannot be replaced by a fresh observation after an await.
+    pub async fn local_use_fence_from(
+        &self,
+        lifetime: &LocalUseLifetime,
+    ) -> Result<LocalUseFence, ClientError> {
+        self.check_captured_local_use_lifetime(lifetime)?;
         let (cached, durable) = self.authorized_local_with_fence().await?;
-        self.check_local_use_generation(&client)?;
+        self.check_captured_local_use_lifetime(lifetime)?;
         Ok(LocalUseFence {
-            client,
+            client: lifetime.client.clone(),
             durable,
             scope: cached.authorization,
             session_binding: cached.credential_fingerprint,
         })
+    }
+
+    /// Synchronous point-in-time check of this client's captured lifetime only.
+    /// Does no protected I/O and grants no authorization. Callers must perform
+    /// validate_local_use first, then check inside a brief publication critical
+    /// section serialized with their cancellation entry point. That entry point
+    /// must hold the same publication lock while rotating the existing generation.
+    pub fn check_local_use_lifetime(&self, fence: &LocalUseFence) -> Result<(), ClientError> {
+        self.check_local_use_generation(&fence.client)
     }
 
     /// Recheck current protected authorization, not just owner IDs. Same-owner
@@ -455,6 +498,63 @@ impl IdentityClient {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod local_use_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pre_enrollment_lifetime_cannot_cross_client_or_survive_cancel() {
+        let client = IdentityClient::new("https://captured-life.example").unwrap();
+        let other = IdentityClient::new("https://captured-life.example").unwrap();
+        let lifetime = client.local_use_lifetime();
+        assert!(client.check_captured_local_use_lifetime(&lifetime).is_ok());
+        assert!(client.view().current_device_id.is_empty());
+        assert!(!client.view().credential_revalidation_required);
+        assert!(matches!(
+            other.local_use_fence_from(&lifetime).await,
+            Err(ClientError::RevalidationRequired)
+        ));
+        assert_eq!(
+            other.check_captured_local_use_lifetime(&lifetime),
+            Err(ClientError::RevalidationRequired)
+        );
+        assert!(!other.view().credential_revalidation_required);
+        client.cancel();
+        *client.cancellation.lock().unwrap() = CancellationToken::new();
+        assert_eq!(
+            client.check_captured_local_use_lifetime(&lifetime),
+            Err(ClientError::RevalidationRequired)
+        );
+        assert!(matches!(
+            client.local_use_fence_from(&lifetime).await,
+            Err(ClientError::RevalidationRequired)
+        ));
+        assert!(!client.view().credential_revalidation_required);
+        let renewed = client.local_use_lifetime();
+        assert!(client.check_local_use_generation(&renewed.client).is_ok());
+        client.cancel_sign_in();
+        assert!(matches!(
+            client.local_use_fence_from(&renewed).await,
+            Err(ClientError::RevalidationRequired)
+        ));
+    }
+
+    #[test]
+    fn new_sign_in_invalidates_local_lifetime_but_same_session_refresh_preserves_it() {
+        let client = IdentityClient::new("https://example.invalid").unwrap();
+        let session = wire::Session {
+            user_id: "owner".into(),
+            tenant_id: "tenant".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+            auth_method: wire::AuthMethod::EmailOtp,
+        };
+        let deadline = crate::Instant::now() + std::time::Duration::from_secs(60);
+        let initial = client.local_use_lifetime();
+        client.set_session(session.clone(), deadline, false);
+        assert!(client.check_captured_local_use_lifetime(&initial).is_err());
+        let current = client.local_use_lifetime();
+        client.set_session(session.clone(), deadline, true);
+        assert!(client.check_captured_local_use_lifetime(&current).is_ok());
+        client.set_session(session, deadline, false);
+        assert!(client.check_captured_local_use_lifetime(&current).is_err());
+    }
 
     #[test]
     fn local_use_is_client_bound_and_cancel_survives_request_token_rotation() {
