@@ -3,6 +3,7 @@
 use crate::runtime::{self, Instant, Task};
 use crate::{ClientError, IdentityClient, SyncRequest, observability_wire as wire};
 use nddev_device_sync_telemetry::ExportFeed;
+mod receipt;
 mod source;
 use source::{Batch, Source};
 use std::{
@@ -138,8 +139,47 @@ async fn run(
     let mut checked: Option<Instant> = None;
     let mut trace_turn = false;
     loop {
+        // Scope loss ends this delivery owner before starting another local ACK.
+        // An SDK operation already admitted still owns its atomic completion.
         if !source.matches(&identity) {
             break;
+        }
+        // A known receipt owns this batch until local settlement. It never
+        // re-enters policy discovery, parking, selection or network delivery.
+        if pending.as_ref().is_some_and(Batch::received) {
+            let batch = pending.as_mut().expect("owned receipted export batch");
+            #[cfg(not(target_arch = "wasm32"))]
+            let full = batch.full_receipt();
+            // One attempt may finish on the original owned tail after payload
+            // expiry. This does not renew the lease or extend batch retention.
+            let settled = tokio::select! {
+                _=cancel.cancelled()=>break,
+                result=batch.acknowledge(&source)=>result,
+            };
+            if settled.is_err() {
+                record_failure(&state);
+                if batch.expired() {
+                    break;
+                }
+                // Local retry keeps the same known receipt. SDK11 renews only
+                // the existing owned sender lease, never the batch retention.
+                tokio::select! { _=cancel.cancelled()=>break, _=runtime::sleep(Duration::from_secs(5))=>{} }
+                continue;
+            }
+            trace_turn = !batch.trace();
+            pending = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            if full {
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_success_at = time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .try_into()
+                    .unwrap_or_default();
+            }
+            delay = Duration::from_millis(200);
+            continue;
         }
         if pending.as_ref().is_some_and(Batch::expired)
             && let Some(batch) = pending.take()
@@ -262,27 +302,11 @@ async fn run(
                 delay = Duration::from_secs(2);
             }
             Ok(receipt)
-                if receipt.accepted >= 0
-                    && receipt.duplicates >= 0
-                    && i64::from(receipt.accepted) + i64::from(receipt.duplicates)
-                        == i64::from(batch.count()) =>
+                if receipt::accepted_count(batch.trace(), batch.count(), &receipt).is_some() =>
             {
-                let batch = pending.take().expect("owned export batch");
-                trace_turn = !batch.trace();
-                if batch.acknowledge(&source).await.is_err() {
-                    record_failure(&state);
-                    checked = None;
-                    delay = Duration::from_secs(5);
-                    continue;
-                }
-                state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .last_success_at = time::OffsetDateTime::now_utc()
-                    .unix_timestamp()
-                    .try_into()
-                    .unwrap_or_default();
-                delay = Duration::from_millis(200);
+                let batch = pending.as_mut().expect("owned export batch");
+                assert!(batch.receive(&receipt));
+                delay = Duration::ZERO;
             }
             Err(error) if terminal(&error) => break,
             Err(ClientError::Busy) => {
