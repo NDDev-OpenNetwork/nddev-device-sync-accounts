@@ -2,13 +2,17 @@
 // and request signatures remain in Rust. No request/response body is logged.
 const requests = new Map();
 const MAX_BYTES = 65536;
+const sync3Methods = new Map([
+  ['/v3/sync', 'GET'], ['/v3/sync/operations', 'POST'],
+  ['/v3/sync/history', 'GET'], ['/v3/sync/base', 'GET'],
+]);
 export function currentOrigin() { return globalThis.location?.origin ?? ''; }
 export function abortRequest(id) { requests.get(id)?.abort(); }
 
 export async function request(id, target, method, headerJson, input, hasBody) {
   const url = new URL(target);
   if (!globalThis.isSecureContext || url.origin !== currentOrigin() || url.username || url.password || url.hash ||
-      !(url.pathname.startsWith('/v2/') || url.pathname === '/v1/health') ||
+      !(url.pathname.startsWith('/v2/') || url.pathname === '/v1/health' || sync3Methods.get(url.pathname) === method) ||
       !['GET','POST','DELETE'].includes(method) || !/^[A-Za-z0-9_-]{32,128}$/.test(id) ||
       requests.has(id) || requests.size >= 4 || headerJson.length > 8192 || input.length > MAX_BYTES) {
     throw new Error('invalid_request');
