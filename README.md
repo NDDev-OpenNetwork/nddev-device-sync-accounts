@@ -63,6 +63,20 @@ credential reads and requests remain local diagnostics, outside the export feeds
 Sign-out/termination closes the feeds; transport acknowledgements are reported
 separately for logs and actual spans and do not imply searchable delivery.
 
+Enabled trace receipts accept zero through the submitted span count, with no
+duplicates. The SDK counts accepted spans as delivered and the remainder as
+dropped. Events still require `accepted + duplicates` to cover the entire batch.
+A known full or partial receipt remains with its batch until local settlement;
+a failed local acknowledgement retries that settlement without resending HTTP.
+The browser SDK preserves the existing sender lease while that owner retries,
+without extending payload retention or acquiring another owner's lease. Scope
+loss, cancellation and termination stop the sender. A known late receipt can
+make one local acknowledgement attempt on its existing owned tail after expiry.
+Unknown responses and a crash or cancellation before local commit retain delivery
+uncertainty; this does not provide exactly-once export. Native freshness advances
+only after a full acknowledgement; browser freshness comes from committed SDK
+health, so partial acceptance does not claim a new full-success timestamp.
+
 The ignored `actual_signed_client_delivery_and_incidents` test requires owned
 server and observability fixture receipts through `NDS_FIXTURE_RECEIPT` and
 `NDS_OBSERVABILITY_FIXTURE_RECEIPT`. It exercises real native credentials, signed
@@ -81,7 +95,8 @@ Physical authenticator qualification is separate.
 Browser telemetry uses the SDK's authenticated-scope IndexedDB spool. RAM ingress
 staging runs independently of the common native/browser HTTP sender; a stalled
 request cannot block new durable batches. Retry counters survive page restart,
-and sender locks are released during backoff or backgrounding. The delivery view
+and sender locks are released during backoff or backgrounding while the receipt
+is unknown. A known receipt keeps the same sender for local settlement. The delivery view
 reports the browser's last payload-write readiness separately from transport
 policy and acknowledgements. A readable store does not prove quota recovery.
 Scope changes stop the sender before old queued data can acquire another owner.
