@@ -26,6 +26,12 @@ pub struct LocalUseFence {
     session_binding: Option<String>,
 }
 
+impl LocalUseFence {
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        self.scope.expires_at_ms
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cached {
@@ -281,6 +287,7 @@ impl IdentityClient {
     }
 
     pub(crate) async fn invalidate_offline(&self, mode: FenceMode) -> Result<(), ClientError> {
+        crate::screen::close_key(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()));
         let old = self.store.authorization_fence(None).await?;
         self.store
             .authorization_fence(Some((old, Fence::new(mode)?)))

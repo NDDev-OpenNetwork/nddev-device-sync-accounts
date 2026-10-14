@@ -2,7 +2,7 @@
 // in Rust. No credential is logged or placed in the replica/application cache.
 const DATABASE = 'nds-credentials-v1';
 const MAX_BYTES = 65536;
-const SERVICES = new Set(['ai.nddev.nds.device.v2', 'ai.nddev.nds.vault.v1', 'ai.nddev.nds.offline.v1']);
+const SERVICES = new Set(['ai.nddev.nds.device.v2', 'ai.nddev.nds.vault.v1', 'ai.nddev.nds.offline.v1', 'ai.nddev.nds.rds.v1']);
 const failure = () => new Error('credential_store_unavailable');
 const identityLeases = new Map();
 

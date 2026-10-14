@@ -5,6 +5,15 @@ use http::Method;
 use nddev_device_sync_http_signatures as signatures;
 use ring::rand::{SecureRandom, SystemRandom};
 
+pub(crate) struct SigningContext {
+    pub device: nddev_device_sync_domain::DeviceId,
+    pub nonce: String,
+    pub created: u64,
+    pub now_ms: u64,
+    pub expires_at_ms: u64,
+    pub session_expires_at_ms: u64,
+}
+
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
 pub enum SyncRequest {
     Append(Vec<u8>),
@@ -45,6 +54,101 @@ impl signatures::SigningKey for Key {
     }
 }
 impl IdentityClient {
+    pub(crate) async fn screen_request(
+        &self,
+        fence: &crate::LocalUseFence,
+        request: crate::screen::Request<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
+        let (_permit, cancel) = self.operation().await?;
+        self.validate_local_use(fence).await?;
+        let view = self.view();
+        let current = view
+            .devices
+            .iter()
+            .find(|device| device.is_current && !device.revoked)
+            .ok_or(ClientError::RevalidationRequired)?;
+        let key = Key {
+            key: crate::devices::read_key(&self.device_store()?)
+                .await?
+                .ok_or(ClientError::RevalidationRequired)?,
+            id: current.device_id.clone(),
+        };
+        let token = self.session_credential().await?;
+        self.validate_local_use(fence).await?;
+        let mut nonce = [0; 24];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| ClientError::CredentialStore)?;
+        let wall_now = time::OffsetDateTime::now_utc();
+        let now_ms = u64::try_from(wall_now.unix_timestamp_nanos() / 1_000_000)
+            .map_err(|_| ClientError::InvalidInput)?;
+        let created: u64 = wall_now
+            .unix_timestamp()
+            .try_into()
+            .map_err(|_| ClientError::InvalidInput)?;
+        let expires_at_ms = created
+            .checked_add(60)
+            .and_then(|v| v.checked_mul(1000))
+            .ok_or(ClientError::InvalidInput)?;
+        if matches!(request, crate::screen::Request::Bind(..))
+            && expires_at_ms > fence.expires_at_ms()
+        {
+            return Err(ClientError::RevalidationRequired);
+        }
+        let context = SigningContext {
+            device: nddev_device_sync_domain::DeviceId::new(current.device_id.clone())
+                .map_err(|_| ClientError::InvalidResponse)?,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            created,
+            now_ms,
+            expires_at_ms,
+            session_expires_at_ms: fence.expires_at_ms(),
+        };
+        let (method, path, body, expected) =
+            request.prepare(&self.endpoint.origin().ascii_serialization(), &context)?;
+        let body = body.map(zeroize::Zeroizing::new);
+        let target = self
+            .endpoint
+            .join(&path)
+            .map_err(|_| ClientError::InvalidEndpoint)?;
+        let signature = signatures::sign(
+            method.as_str(),
+            target.as_str(),
+            body.as_deref().map_or(&[], |v| v.as_slice()),
+            &key,
+            &context.nonce,
+            context.created,
+        )
+        .map_err(|_| ClientError::InvalidInput)?;
+        if cancel.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        let result = self
+            .request_bytes(
+                WireRequest {
+                    method,
+                    path: &path,
+                    body: body.as_deref().map(|bytes| bytes.to_vec()),
+                    token: Some(&token),
+                    locale: "en",
+                    signature: Some(signature),
+                },
+                &cancel,
+            )
+            .await;
+        // Even a successful late response cannot publish an old local lifetime.
+        self.validate_local_use(fence).await?;
+        if cancel.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        let (status, bytes) = result?;
+        let bytes = zeroize::Zeroizing::new(bytes);
+        if status.as_u16() != expected {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(bytes)
+    }
+
     /// Native consumers only. This namespace never appears in the FFI surface;
     /// vault keys survive sign-out and are separate from device signing keys.
     pub fn vault_credentials(&self) -> Result<crate::SessionStore, ClientError> {
