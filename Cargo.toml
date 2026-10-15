@@ -12,14 +12,15 @@ development-http = []
 
 [dependencies]
 http = "1"
-nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", rev = "2d02bfca16266e7c343b024807362c7cbbf8f7c6" }
-base64 = "0.22"
+nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol.git", rev = "13cc597f76b823d707ce12611ee3dafa03d4ae0b" }
+base64 = "0.23.1"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "19ceef8a233b68ace3b18ebeb852633ed26d208c" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11.1"
+base16ct = { version = "1.0", features = ["alloc"] }
 thiserror = "2"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["sync", "macros"] }
@@ -64,7 +65,7 @@ js-sys = "=0.3.106"
 uuid = { version = "1.27", features = ["js"] }
 web-time = "1.1"
 futures = "0.3"
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
