@@ -30,7 +30,7 @@ fn scope(identity: &IdentityClient) -> String {
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value.as_bytes());
     }
-    format!("{:x}", hash.finalize())
+    base16ct::lower::encode_string(&hash.finalize())
 }
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]

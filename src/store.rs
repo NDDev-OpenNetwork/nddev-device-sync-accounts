@@ -39,7 +39,7 @@ static OWNERS: OnceLock<Mutex<HashMap<String, Weak<SessionOwner>>>> = OnceLock::
 impl SessionStore {
     pub fn for_endpoint(endpoint: &str) -> Result<Self, ClientError> {
         let endpoint = crate::validate_endpoint(endpoint)?;
-        let key = format!("{:x}", Sha256::digest(endpoint.as_str().as_bytes()));
+        let key = base16ct::lower::encode_string(&Sha256::digest(endpoint.as_str().as_bytes()));
         let mut owners = OWNERS
             .get_or_init(Mutex::default)
             .lock()
@@ -76,7 +76,7 @@ impl SessionStore {
         }
         Self {
             service: "ai.nddev.nds.device.v2",
-            key: format!("{:x}", digest.finalize()),
+            key: base16ct::lower::encode_string(&digest.finalize()),
             owner: self.owner.clone(),
         }
     }
@@ -95,7 +95,7 @@ impl SessionStore {
         }
         Self {
             service: "ai.nddev.nds.rds.v1",
-            key: format!("{:x}", digest.finalize()),
+            key: base16ct::lower::encode_string(&digest.finalize()),
             owner: self.owner.clone(),
         }
     }
@@ -103,10 +103,8 @@ impl SessionStore {
     pub(crate) fn offline_store(&self, slot: u8) -> Self {
         let mut store = self.clone();
         store.service = "ai.nddev.nds.offline.v1";
-        store.key = format!(
-            "{:x}",
-            Sha256::digest(format!("{}:offline:{slot}", self.key))
-        );
+        store.key =
+            base16ct::lower::encode_string(&Sha256::digest(format!("{}:offline:{slot}", self.key)));
         store
     }
 
@@ -273,5 +271,31 @@ fn native_store() -> keyring_core::Result<Arc<CredentialStore>> {
     #[cfg(target_os = "android")]
     {
         Ok(android_native_keyring_store::Store::new()?)
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn credential_names_preserve_the_existing_sha256_hex_encoding() {
+        let store = SessionStore::for_endpoint("https://example.invalid/").unwrap();
+        assert_eq!(
+            store.key,
+            "d8c0a7de34ba33bbd330fd412f87b2550e3947349c8717827335df10c0557fbd"
+        );
+        assert_eq!(
+            store.device_store("tenant", "user").key,
+            "8534cc9087ec67322196e2b2478ff5c3d7e6090947002234b5f1b9e08fee1707"
+        );
+        assert_eq!(
+            store.rds_store("tenant", "user", "device").key,
+            "cd30eea48d9f2c4ccca7c95e7877cd67f282d70be5067ebae7a50aad875e48e1"
+        );
+        assert_eq!(
+            store.offline_store(0).key,
+            "3c5cae1397461791a6dfc97fdba1adb907b627e2801fe0b43009ce080af16546"
+        );
     }
 }
