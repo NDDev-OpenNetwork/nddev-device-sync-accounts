@@ -62,7 +62,9 @@ impl SessionCredential {
             #[cfg(not(target_arch = "wasm32"))]
             Self::Bearer(token) => {
                 use sha2::{Digest, Sha256};
-                Some(format!("{:x}", Sha256::digest(token.as_bytes())))
+                Some(base16ct::lower::encode_string(&Sha256::digest(
+                    token.as_bytes(),
+                )))
             }
             #[cfg(target_arch = "wasm32")]
             Self::BrowserCookie => None,
