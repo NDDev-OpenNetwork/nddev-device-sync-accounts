@@ -12,7 +12,7 @@ Email OTP, GitHub and passkey sign-in use protocol v2. Native tokens stay in cre
 stores; the client exposes only session metadata and bounded sign-in progress.
 Harness profiles and vault recovery are not implemented here. Device enrollment, inventory and revocation use the same native session boundary.
 
-Use Rust 1.99.0. `just check` runs formatting, nextest, Clippy and dependency advisory/license gates;
+Use the compiler pinned in `rust-toolchain.toml`. `just check` runs formatting, nextest, Clippy and dependency advisory/license gates;
 `just native-store` additionally exercises a fresh entry in the actual native
 credential service. It requires an unlocked session and never clears a keychain.
 `just generate` and `just generated-check` use the immutable `protocol.lock`
