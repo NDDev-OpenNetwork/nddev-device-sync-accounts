@@ -21,10 +21,10 @@ async fn owned_ephemeral_entry_round_trips_and_is_deleted() {
         Config {
             service: "nds-native-store-acceptance".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            repository: "NDDev-OpenNetwork/nddev-device-sync-accounts".into(),
+            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
             commit: "unknown".into(),
             channel: "alpha".into(),
-            standards: "v0.0.1-alpha.9".into(),
+            standards: "unreleased".into(),
             environment: "test".into(),
             target_prefixes: vec!["nds_accounts".into()],
             default_module: "accounts".into(),
