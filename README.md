@@ -27,6 +27,9 @@ held until the OS call actually returns, including after a caller timeout.
 Native read/write/delete outcomes use the same SDK and retain trace context across
 the blocking OS worker. A caller wait failure and a later OS completion are distinct;
 keys, endpoints, secret values and raw provider errors never enter those events.
+On Linux, that endpoint owner also retains its provider connection; every read
+still queries the actual credential service. Provider failure discards the connection
+before releasing I/O admission, without replaying an uncertain write.
 
 Linux uses Secret Service, Android uses Android Keystore-encrypted preferences
 with an application-context JNI initializer, Apple uses Keychain and Windows
