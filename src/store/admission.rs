@@ -114,29 +114,30 @@ impl SessionStore {
     ) -> Result<OperationPermit, ClientError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let key = self.key.clone();
             let owner = self.owner.clone();
-            let work = tokio::task::spawn_blocking(move || {
-                let lease = Arc::new(acquire_native(&key)?);
+            self.run_io("identity.operation.admitted", move |_, key| {
+                let lease = Arc::new(acquire_native(key)?);
                 *owner.lease.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&lease);
                 Ok(OperationPermit {
                     _local: local,
                     _lease: lease,
                 })
-            });
-            tokio::time::timeout(Duration::from_secs(15), work)
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|_| ClientError::CredentialStore)?
+            })
+            .await
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let lease = web::acquire(&self.key).await?;
-            *self.owner.lease.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&lease);
-            Ok(OperationPermit {
-                _local: local,
-                _lease: lease,
+            let key = self.key.clone();
+            let owner = self.owner.clone();
+            self.browser_io("identity.operation.admitted", async move {
+                let lease = web::acquire(&key).await?;
+                *owner.lease.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&lease);
+                Ok(OperationPermit {
+                    _local: local,
+                    _lease: lease,
+                })
             })
+            .await
         }
     }
 }
