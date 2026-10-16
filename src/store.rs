@@ -5,12 +5,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod fence;
@@ -20,6 +21,15 @@ pub(crate) use admission::OperationPermit;
 pub(crate) use admission::RdsLease;
 
 const SERVICE: &str = "ai.nddev.nds.session.v2";
+// One platform call and at most seven waiting callers per endpoint. Waiting is
+// cancellable and shares the existing 15-second I/O deadline with execution.
+const MAX_IO_REQUESTS: usize = 8;
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct IoPermit {
+    _serial: OwnedSemaphorePermit,
+    _request: OwnedSemaphorePermit,
+}
 
 /// Explicit platform credential backends; no plaintext or metadata fallback.
 #[derive(Clone)]
@@ -31,6 +41,7 @@ pub struct SessionStore {
 
 struct SessionOwner {
     io: Arc<Semaphore>,
+    io_requests: Arc<Semaphore>,
     operation: Arc<Semaphore>,
     lease: Mutex<Weak<admission::Lease>>,
     // A Linux provider owns a D-Bus connection and encryption session, not
@@ -97,6 +108,7 @@ impl SessionStore {
             }
             let owner = Arc::new(SessionOwner {
                 io: Arc::new(Semaphore::new(1)),
+                io_requests: Arc::new(Semaphore::new(MAX_IO_REQUESTS)),
                 operation: Arc::new(Semaphore::new(1)),
                 lease: Mutex::default(),
                 #[cfg(target_os = "linux")]
@@ -155,16 +167,42 @@ impl SessionStore {
     }
 
     pub(crate) fn operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {
-        let permit = self
-            .owner
+        self.owner
             .operation
             .clone()
             .try_acquire_owned()
-            .map_err(|_| ClientError::Busy)?;
-        if self.owner.io.available_permits() == 0 {
-            return Err(ClientError::Busy);
+            .map_err(|_| ClientError::Busy)
+    }
+
+    async fn admit_io(&self, span: &tracing::Span) -> Result<(IoPermit, Duration), ClientError> {
+        let started = crate::runtime::Instant::now();
+        let rejected = |error: ClientError| {
+            span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                event.name="identity.credential.admission_rejected", error.type=error.code(), outcome="rejected"
+            }));
+            error
+        };
+        let request = self
+            .owner
+            .io_requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| rejected(ClientError::Busy))?;
+        let serial = crate::runtime::timeout(IO_TIMEOUT, self.owner.io.clone().acquire_owned())
+            .await
+            .map_err(|_| rejected(ClientError::Timeout))?
+            .map_err(|_| rejected(ClientError::CredentialStore))?;
+        let remaining = IO_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(rejected(ClientError::Timeout));
         }
-        Ok(permit)
+        Ok((
+            IoPermit {
+                _serial: serial,
+                _request: request,
+            },
+            remaining,
+        ))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -175,17 +213,7 @@ impl SessionStore {
     ) -> Result<T, ClientError> {
         let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
             .map_err(|_| ClientError::TelemetryUnavailable)?;
-        let permit = self
-            .owner
-            .io
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                    event.name="identity.credential.admission_rejected", error.type="busy", outcome="rejected"
-                }));
-                ClientError::Busy
-            })?;
+        let (permit, remaining) = self.admit_io(&span).await?;
         let key = self.key.clone();
         let service = self.service;
         let owner = self.owner.clone();
@@ -224,7 +252,7 @@ impl SessionStore {
         })
             })
         });
-        match tokio::time::timeout(Duration::from_secs(15), work).await {
+        match tokio::time::timeout(remaining, work).await {
             Ok(Ok(result)) => result,
             failed => {
                 let error = if failed.is_err() {
@@ -337,6 +365,9 @@ fn native_store() -> keyring_core::Result<Arc<CredentialStore>> {
         Ok(android_native_keyring_store::Store::new()?)
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod io_tests;
 
 #[cfg(test)]
 mod compatibility_tests {
