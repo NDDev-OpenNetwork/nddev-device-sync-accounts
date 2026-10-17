@@ -70,6 +70,30 @@ impl IdentityClient {
     }
 }
 
+// A presentation router may already have normalized location.href before it
+// delivers the original route. Validate that input without restoring a secret URL.
+#[cfg(any(target_arch = "wasm32", test))]
+fn routed_link(
+    route: Zeroizing<String>,
+    endpoint: &url::Url,
+) -> Result<Zeroizing<String>, ClientError> {
+    if route.len() > 2048 {
+        return Err(ClientError::InvalidInput);
+    }
+    let fragment = route
+        .strip_prefix("/#")
+        .or_else(|| route.strip_prefix('/'))
+        .or_else(|| route.strip_prefix('#'))
+        .unwrap_or(&route);
+    let link = if fragment.starts_with("invite/") {
+        Zeroizing::new(format!("{}#{fragment}", endpoint.as_str()))
+    } else {
+        route
+    };
+    InvitationLink::parse(Zeroizing::new(link.to_string()), endpoint)?;
+    Ok(link)
+}
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use super::*;
@@ -97,12 +121,33 @@ mod browser {
         *LINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(href);
         Ok(())
     }
+    pub fn capture_route(route: String) -> Result<(), ClientError> {
+        let window = web_sys::window().ok_or(ClientError::InvalidInput)?;
+        let location = window.location();
+        let href = Zeroizing::new(location.href().map_err(|_| ClientError::InvalidInput)?);
+        // Clear the current entry/state even when the router already removed its
+        // fragment. No token is reintroduced into browser navigation history.
+        window
+            .history()
+            .map_err(|_| ClientError::InvalidInput)?
+            .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", href.split('#').next())
+            .map_err(|_| ClientError::InvalidInput)?;
+        let origin = location.origin().map_err(|_| ClientError::InvalidInput)?;
+        let endpoint =
+            url::Url::parse(&format!("{origin}/")).map_err(|_| ClientError::InvalidInput)?;
+        let link = routed_link(Zeroizing::new(route), &endpoint)?;
+        *LINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(link);
+        Ok(())
+    }
     pub fn take() -> Option<Zeroizing<String>> {
         LINK.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 #[cfg(target_arch = "wasm32")]
-pub use browser::{capture as capture_browser_invitation, take as take_browser_invitation};
+pub use browser::{
+    capture as capture_browser_invitation, capture_route as capture_browser_invitation_route,
+    take as take_browser_invitation,
+};
 
 #[cfg(test)]
 mod tests {
@@ -127,6 +172,35 @@ mod tests {
             link.replace(&material, "x"),
         ] {
             assert!(InvitationLink::parse(Zeroizing::new(bad), &endpoint).is_err());
+        }
+    }
+    #[test]
+    fn original_router_input_survives_location_normalization_without_cross_origin_authority() {
+        let endpoint = url::Url::parse("https://example.invalid/").unwrap();
+        let part = URL_SAFE_NO_PAD.encode([2; 32]);
+        let fragment = format!("invite/{part}/{part}");
+        let expected = format!("https://example.invalid/#{fragment}");
+        for route in [
+            fragment.clone(),
+            format!("/{fragment}"),
+            format!("#{fragment}"),
+            format!("/#{fragment}"),
+            expected.clone(),
+        ] {
+            assert_eq!(
+                routed_link(Zeroizing::new(route), &endpoint)
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+        }
+        for route in [
+            format!("https://other.invalid/#{fragment}"),
+            format!("https://example.invalid/path#{fragment}"),
+            format!("/{fragment}?query"),
+            "/invite/invalid".into(),
+        ] {
+            assert!(routed_link(Zeroizing::new(route), &endpoint).is_err());
         }
     }
     #[tokio::test]
