@@ -140,3 +140,9 @@ URL with a canonical fragment; it retains one link in Rust memory, refuses an
 active account/flow, and selects the existing email OTP workflow. Success or
 cancellation clears the link. No token is exposed in `View`. Browser composition
 captures and clears the fragment before presentation routing.
+
+Passkey login accepts the Core-validated email selector from presentation and
+sends it in the generated request body. It never selects the first/bootstrap
+member locally. An omitted selector is resolved only by the server's existing
+unambiguous-account rule. Registration rejects a selector and remains bound to
+the current authenticated session; selectors are never credential proof or logs.

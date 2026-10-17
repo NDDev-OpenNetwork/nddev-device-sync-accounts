@@ -554,9 +554,11 @@ impl IdentityClient {
     pub async fn start_passkey(
         &self,
         registration: bool,
+        email: Option<String>,
         locale: &str,
     ) -> Result<View, ClientError> {
         self.observe("identity.passkey.start", async {
+            let request = passkey_request(registration, email)?;
             self.require_store_ready()?;
             let (_permit, cancel) = self.operation().await?;
             self.finish_pending_logout(&cancel).await?;
@@ -570,10 +572,7 @@ impl IdentityClient {
                 .request(
                     Method::POST,
                     "/v2/auth/passkeys/start",
-                    Some(&wire::PasskeyRequest {
-                        registration,
-                        email: None,
-                    }),
+                    Some(&request),
                     token,
                     locale,
                     &cancel,
@@ -1521,5 +1520,57 @@ mod native_completion_tests {
             validate_session(&session),
             Err(ClientError::InvalidResponse)
         );
+    }
+}
+
+/// Identity selection is distinct from authentication. Registration has no
+/// selector: its owner comes exclusively from the verified current session.
+fn passkey_request(
+    registration: bool,
+    email: Option<String>,
+) -> Result<wire::PasskeyRequest, ClientError> {
+    if registration && email.is_some() {
+        return Err(ClientError::InvalidInput);
+    }
+    let email = email
+        .map(|value| {
+            nddev_device_sync_domain::identity::EmailAddress::parse(&value)
+                .map(|email| email.as_str().to_owned())
+                .map_err(|_| ClientError::InvalidInput)
+        })
+        .transpose()?;
+    Ok(wire::PasskeyRequest {
+        registration,
+        email,
+    })
+}
+
+#[cfg(test)]
+mod passkey_selector_tests {
+    use super::*;
+    #[test]
+    fn generated_request_carries_canonical_selector_only_for_login() {
+        let value = passkey_request(false, Some(" Member@Example.Invalid ".into())).unwrap();
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"registration":false,"email":"member@example.invalid"})
+        );
+        assert_eq!(
+            serde_json::to_value(passkey_request(true, None).unwrap()).unwrap(),
+            serde_json::json!({"registration":true})
+        );
+        // The server alone can resolve an omitted selector to one active account.
+        assert_eq!(
+            serde_json::to_value(passkey_request(false, None).unwrap()).unwrap(),
+            serde_json::json!({"registration":false})
+        );
+        for value in [
+            "",
+            "not-email",
+            "person@example.invalid\nother@example.invalid",
+        ] {
+            assert!(passkey_request(false, Some(value.into())).is_err());
+        }
+        assert!(passkey_request(true, Some("other@example.invalid".into())).is_err());
     }
 }
