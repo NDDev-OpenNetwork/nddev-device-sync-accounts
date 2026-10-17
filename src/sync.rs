@@ -36,6 +36,8 @@ pub enum SyncRequest {
     VaultKey(Vec<u8>),
     Telemetry(Vec<u8>),
     NativeTraces(Vec<u8>),
+    /// Export policy for any active client; no global operator data.
+    TelemetryPolicy,
     ObservabilityStatus,
     Incidents {
         after: String,
@@ -70,6 +72,9 @@ impl SyncRequest {
                     return Err(ClientError::InvalidInput);
                 }
                 Ok((Method::POST, "/v2/observability/traces".into(), Some(body)))
+            }
+            SyncRequest::TelemetryPolicy => {
+                Ok((Method::GET, "/v2/observability/client-policy".into(), None))
             }
             SyncRequest::ObservabilityStatus => {
                 Ok((Method::GET, "/v2/observability/status".into(), None))
@@ -366,6 +371,7 @@ impl IdentityClient {
             &request,
             SyncRequest::Telemetry(_)
                 | SyncRequest::NativeTraces(_)
+                | SyncRequest::TelemetryPolicy
                 | SyncRequest::ObservabilityStatus
                 | SyncRequest::Incidents { .. }
                 | SyncRequest::IncidentAction { .. }

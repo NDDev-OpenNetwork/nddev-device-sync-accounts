@@ -62,11 +62,16 @@ keyring, offline restart and later pipeline acceptance remain separate gates.
 
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
-operator export policy, pauses in the background and uses bounded backoff with
+the narrow `/v2/observability/client-policy` export policy, pauses in the background and uses bounded backoff with
 at most eight failed sends per batch and 30-minute retention. Delivery's own
 credential reads and requests remain local diagnostics, outside the export feeds.
 Sign-out/termination closes the feeds; transport acknowledgements are reported
 separately for logs and actual spans and do not imply searchable delivery.
+
+The sender does not require global operator status or incident privileges.
+Company administrators and ordinary users retain telemetry delivery; denial of
+an operator request does not invalidate their personal session. The server must
+provide the narrow policy route before deploying this client revision.
 
 Enabled trace receipts accept zero through the submitted span count, with no
 duplicates. The SDK counts accepted spans as delivered and the remainder as

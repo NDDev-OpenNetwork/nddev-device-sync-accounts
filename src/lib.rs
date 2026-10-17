@@ -538,7 +538,10 @@ impl IdentityClient {
                 .request(
                     Method::POST,
                     "/v2/auth/passkeys/start",
-                    Some(&wire::PasskeyRequest { registration }),
+                    Some(&wire::PasskeyRequest {
+                        registration,
+                        email: None,
+                    }),
                     token,
                     locale,
                     &cancel,
