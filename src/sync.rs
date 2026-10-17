@@ -16,6 +16,7 @@ pub(crate) struct SigningContext {
 
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
 pub enum SyncRequest {
+    Company(crate::company::CompanyRequest),
     Append(Vec<u8>),
     Page {
         after: u64,
@@ -61,6 +62,7 @@ impl SyncRequest {
     }
     fn prepare(self) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
         match self {
+            Self::Company(request) => request.prepare(),
             SyncRequest::Telemetry(body) => {
                 if body.is_empty() || body.len() > 65_536 {
                     return Err(ClientError::InvalidInput);
@@ -385,7 +387,7 @@ impl IdentityClient {
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation().await?;
-        let fence = if request.is_v3() {
+        let fence = if request.is_v3() || matches!(&request, SyncRequest::Company(_)) {
             Some(self.local_use_fence().await?)
         } else {
             self.authorize_local().await?;

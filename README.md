@@ -131,3 +131,12 @@ outside Flutter, telemetry, URLs and synchronization. The server remains the
 canonical authority for participant roles, binding revisions and finite
 retention; metadata and Ready do not authorize capture. Lost acknowledgements
 or termination before local reconciliation retain delivery uncertainty.
+
+Company transport uses the closed `CompanyRequest` route set and generated
+Protocol company DTOs. Signed company requests revalidate the original local
+identity lifetime before publishing responses. Administrative denials do not
+clear a valid session. `import_invitation` accepts only an exact-instance root
+URL with a canonical fragment; it retains one link in Rust memory, refuses an
+active account/flow, and selects the existing email OTP workflow. Success or
+cancellation clears the link. No token is exposed in `View`. Browser composition
+captures and clears the fragment before presentation routing.

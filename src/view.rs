@@ -38,6 +38,7 @@ impl ClientError {
 /// Presentation state, never a bearer credential or a wire request.
 #[derive(Clone, Default)]
 pub struct View {
+    pub invitation_pending: bool,
     pub devices: Vec<DeviceView>,
     pub current_device_id: String,
     pub devices_checked_at: i64,
