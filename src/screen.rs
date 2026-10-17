@@ -453,6 +453,41 @@ impl IdentityClient {
         }
         Ok(())
     }
+    /// Fresh participant authorization for an already admitted media stream.
+    /// This never renews its lease or treats cached metadata as server authority.
+    pub async fn screen_revalidate(
+        &self,
+        fence: &LocalUseFence,
+        original: &ViewProjection,
+    ) -> Result<bool, ClientError> {
+        let device = self.view().current_device_id;
+        let current = if original.permit().viewer.as_str() == device {
+            Some(self.screen_view(fence, original.id()).await?.view)
+        } else if original.permit().host.as_str() == device {
+            self.screen_incoming(fence).await?
+        } else {
+            return Err(ClientError::RevalidationRequired);
+        };
+        let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+            .try_into()
+            .map_err(|_| ClientError::RevalidationRequired)?;
+        self.validate_local_use(fence).await?;
+        current_view(original, current, now)
+    }
+}
+
+fn current_view(
+    original: &ViewProjection,
+    current: Option<ViewProjection>,
+    now: u64,
+) -> Result<bool, ClientError> {
+    let Some(mut current) = current else {
+        return Ok(false);
+    };
+    if !same_view(original, &current) {
+        return Err(ClientError::InvalidResponse);
+    }
+    Ok(current.state(now) == ViewState::Ready)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {

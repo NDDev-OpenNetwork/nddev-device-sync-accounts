@@ -163,3 +163,44 @@ fn original_create_bytes_and_profile_do_not_change_during_retry() {
     wrong.expires_at_ms = 4000;
     assert!(!same_view(&original, &projection(wrong).unwrap()));
 }
+
+#[test]
+fn live_revalidation_never_renews_or_substitutes_an_admitted_view() {
+    let original = projection(row()).unwrap();
+    assert_eq!(
+        current_view(&original, Some(projection(row()).unwrap()), 1500),
+        Ok(true)
+    );
+    assert_eq!(current_view(&original, None, 1500), Ok(false));
+    assert_eq!(
+        current_view(&original, Some(projection(row()).unwrap()), 3000),
+        Ok(false)
+    );
+    for state in [dto::State::Requested, dto::State::Ended] {
+        let mut current = row();
+        current.state = state;
+        assert_eq!(
+            current_view(&original, Some(projection(current).unwrap()), 1500),
+            Ok(false)
+        );
+    }
+    for field in [
+        "view", "viewer", "host", "endpoint", "revision", "expiry", "profile",
+    ] {
+        let mut current = row();
+        match field {
+            "view" => current.view_id = "another-view".into(),
+            "viewer" => current.viewer_device_id = "another-viewer".into(),
+            "host" => current.host_device_id = "another-host".into(),
+            "endpoint" => current.host_endpoint = key(3),
+            "revision" => current.host_revision += 1,
+            "expiry" => current.expires_at_ms += 1000,
+            "profile" => current.output_height = 720,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            current_view(&original, Some(projection(current).unwrap()), 1500),
+            Err(ClientError::InvalidResponse)
+        ));
+    }
+}
