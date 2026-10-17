@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts"
 
 [features]
+browser-bindings = ["dep:tsify"]
 default = []
 development-http = []
 
@@ -27,7 +28,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "6cf8b2ee69fd6a64bd218b47db55378191f66907", features = ["client-traces"] }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "1327eb1fc1a31bd767582d1fa204d2ae204b89df", features = ["client-traces"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -60,6 +61,7 @@ prost = "0.14"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 ring = {version="0.17", features=["wasm32_unknown_unknown_js"]}
 time = {version="0.3", features=["wasm-bindgen"]}
 wasm-bindgen = "=0.2.129"
