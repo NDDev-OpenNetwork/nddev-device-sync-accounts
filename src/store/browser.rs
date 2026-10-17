@@ -39,12 +39,7 @@ impl SessionStore {
     ) -> Result<T, ClientError> {
         let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
             .map_err(|_| ClientError::TelemetryUnavailable)?;
-        let permit = self
-            .owner
-            .io
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ClientError::Busy)?;
+        let (permit, remaining) = self.admit_io(&span).await?;
         let owner = self.owner.clone();
         let lease = owner
             .lease
@@ -69,7 +64,7 @@ impl SessionStore {
         }.instrument(span.clone()));
         match futures::future::select(
             receiver.boxed_local(),
-            gloo_timers::future::TimeoutFuture::new(15_000).boxed_local(),
+            gloo_timers::future::TimeoutFuture::new(remaining.as_millis() as u32).boxed_local(),
         )
         .await
         {
