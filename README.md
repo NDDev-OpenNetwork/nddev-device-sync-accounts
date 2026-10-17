@@ -20,8 +20,10 @@ source from `NDS_PROTOCOL_SOURCE` (defaults to the adjacent protocol checkout).
 
 HTTPS is required. The opt-in `development-http` feature permits loopback HTTP
 in debug builds for isolated local acceptance only; ship without that feature.
-HTTP redirects are rejected. Requests and native operations have 15-second
-deadlines; overlapping calls return `busy` instead of entering an unbounded queue.
+HTTP redirects are rejected. Requests and credential operations have 15-second
+deadlines. Native and browser credential I/O share one admission policy per endpoint:
+one executing call and at most seven waiting callers, with waiting included in the
+operation's deadline. A full queue or conflicting identity mutation returns `busy`.
 Native OS calls cannot be preempted, so their single admission permit remains
 held until the OS call actually returns, including after a caller timeout.
 Native read/write/delete outcomes use the same SDK and retain trace context across
